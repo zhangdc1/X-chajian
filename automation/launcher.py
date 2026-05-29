@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, ttk
+from typing import Any, Dict
+
+try:
+    import yaml
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError("缺少 PyYAML，启动器无法读取配置") from exc
+
+from automation.license_guard import LicenseGuard
+
+
+CONFIG_PATH = Path("automation_config.yaml")
+
+
+def load_config() -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        template = Path("automation_config.example.yaml")
+        if template.exists():
+            CONFIG_PATH.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            CONFIG_PATH.write_text(
+                "node_id: PC-01\n"
+                "label: Office PC 01\n"
+                "central_api: https://your-domain.example\n"
+                "central_token: change-me\n"
+                "worker_enabled: true\n"
+                "card_number: ''\n"
+                "app_version: '1.0.0'\n"
+                "require_license: true\n"
+                "license_heartbeat_seconds: 60\n"
+                "license_max_failures: 3\n"
+                "bit_api_url: http://127.0.0.1:54345\n"
+                "sync_group_ids: []\n",
+                encoding="utf-8",
+            )
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def save_config(config: Dict[str, Any]) -> None:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+
+def exe_path(name: str, module: str) -> list[str]:
+    base = Path(sys.executable).resolve().parent
+    client_root = base.parent.parent if base.parent.name == "runtime" else base
+    candidate = client_root / "runtime" / Path(name).stem / name
+    if candidate.exists():
+        return [str(candidate)]
+    candidate = client_root / name
+    if candidate.exists():
+        return [str(candidate)]
+    return [sys.executable, "-m", module]
+
+
+class Launcher(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("XBot 客户端启动器")
+        self.geometry("520x330")
+        self.resizable(False, False)
+        self.config_data = load_config()
+        self.vars = {
+            "card_number": tk.StringVar(value=str(self.config_data.get("card_number") or "")),
+            "central_api": tk.StringVar(value=str(self.config_data.get("central_api") or "")),
+            "central_token": tk.StringVar(value=str(self.config_data.get("central_token") or "")),
+            "node_id": tk.StringVar(value=str(self.config_data.get("node_id") or "PC-01")),
+            "sync_group_ids": tk.StringVar(value=",".join(self.config_data.get("sync_group_ids") or [])),
+        }
+        self._build()
+
+    def _build(self) -> None:
+        frame = ttk.Frame(self, padding=18)
+        frame.pack(fill=tk.BOTH, expand=True)
+        fields = [
+            ("卡密", "card_number", True),
+            ("中央服务器", "central_api", False),
+            ("中央Token", "central_token", True),
+            ("电脑编号", "node_id", False),
+            ("比特分组ID", "sync_group_ids", False),
+        ]
+        for row, (label, key, secret) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=6)
+            entry = ttk.Entry(frame, textvariable=self.vars[key], width=46, show="*" if secret else "")
+            entry.grid(row=row, column=1, sticky=tk.EW, pady=6)
+        hint = ttk.Label(frame, text="多个比特分组ID用英文逗号分隔。首次启动会验证卡密，验证通过后保存配置。")
+        hint.grid(row=len(fields), column=0, columnspan=2, sticky=tk.W, pady=(8, 14))
+        btns = ttk.Frame(frame)
+        btns.grid(row=len(fields) + 1, column=0, columnspan=2, sticky=tk.E)
+        ttk.Button(btns, text="保存并启动Worker", command=self.save_validate_start).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="打开面板", command=self.open_panel).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="退出", command=self.destroy).pack(side=tk.LEFT, padx=4)
+        frame.columnconfigure(1, weight=1)
+
+    def collect_config(self) -> Dict[str, Any]:
+        config = dict(self.config_data)
+        config["card_number"] = self.vars["card_number"].get().strip()
+        config["central_api"] = self.vars["central_api"].get().strip().rstrip("/")
+        config["central_token"] = self.vars["central_token"].get().strip()
+        config["node_id"] = self.vars["node_id"].get().strip() or "PC-01"
+        config["label"] = config.get("label") or config["node_id"]
+        groups = [item.strip() for item in self.vars["sync_group_ids"].get().split(",") if item.strip()]
+        config["sync_group_ids"] = groups
+        config["require_license"] = True
+        config.setdefault("app_version", "1.0.0")
+        config.setdefault("worker_enabled", True)
+        config.setdefault("bit_api_url", "http://127.0.0.1:54345")
+        config.setdefault("poll_interval_seconds", 5)
+        config.setdefault("license_heartbeat_seconds", 60)
+        config.setdefault("license_max_failures", 3)
+        return config
+
+    def save_validate_start(self) -> None:
+        config = self.collect_config()
+        missing = [key for key in ("card_number", "central_api", "central_token", "node_id") if not config.get(key)]
+        if missing:
+            messagebox.showwarning("缺少配置", "请填写：" + "、".join(missing))
+            return
+        guard = LicenseGuard(config.get("card_number"), config.get("app_version", "1.0.0"))
+        result = guard.validate_once()
+        if not result.ok:
+            messagebox.showerror("卡密验证失败", result.message)
+            return
+        save_config(config)
+        messagebox.showinfo("验证成功", "卡密验证成功，正在启动 Worker。")
+        self.start_worker()
+
+    def start_worker(self) -> None:
+        cmd = exe_path("XBotWorker.exe", "automation.worker")
+        subprocess.Popen([*cmd, "--config", str(CONFIG_PATH)], cwd=os.getcwd(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    def open_panel(self) -> None:
+        cmd = exe_path("XBotPanel.exe", "automation.panel_entry")
+        subprocess.Popen(cmd, cwd=os.getcwd(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
+def main() -> None:
+    app = Launcher()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

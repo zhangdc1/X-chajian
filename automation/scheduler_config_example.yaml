@@ -1,0 +1,6 @@
+central_api: http://127.0.0.1:8766
+central_token: change-me
+
+scheduler_interval_seconds: 30
+dispatch_limit: 100
+

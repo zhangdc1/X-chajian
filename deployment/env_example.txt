@@ -1,0 +1,5 @@
+CENTRAL_HOST=0.0.0.0
+CENTRAL_PORT=8766
+CENTRAL_TOKEN=change-this-long-random-token
+DISCORD_TOKEN=put-your-discord-bot-token-here
+

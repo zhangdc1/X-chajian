@@ -1,0 +1,16 @@
+# OpenAI-compatible model settings for semantic commands, plan parsing and smart comments.
+# Copy this file to model_config.yaml on the machine that needs model features.
+enabled: false
+provider: openai_compatible
+base_url: "https://api.deepseek.com/v1"
+api_key: "put-your-api-key-here"
+model: "deepseek-chat"
+timeout_seconds: 30
+temperature: 0.1
+
+smart_comment:
+  enabled: true
+  auto_publish: true
+  save_drafts: true
+  fallback_to_comment_library: true
+  output_path: output/comment_drafts.jsonl

@@ -1,0 +1,13 @@
+discord_token: "put-your-discord-bot-token-here"
+command_prefix: "!"
+
+central_api: http://127.0.0.1:8766
+central_token: change-me
+
+# Optional proxy for Discord connections, for example:
+# proxy: http://127.0.0.1:7890
+proxy: ""
+
+# Optional: restrict command execution to these Discord user IDs. Leave empty to
+# allow every user in the server who can mention the bot.
+allowed_user_ids: []

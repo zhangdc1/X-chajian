@@ -1,0 +1,48 @@
+# Copy to automation_config.yaml on each local machine.
+node_id: PC-01
+label: Office PC 01
+
+central_api: http://127.0.0.1:8766
+central_token: change-me
+
+worker_enabled: true
+poll_interval_seconds: 5
+max_concurrency: 1
+
+# Keep this separate from the GUI config.yaml so manual local operation is
+# unchanged.
+bit_api_url: http://127.0.0.1:54345
+sync_group_ids: []
+sync_profiles_on_start: true
+sync_profiles_interval_seconds: 300
+
+# Existing card-key system. Leave empty during local skeleton testing, then
+# fill before production packaging.
+card_number: ""
+app_version: "1.0.0"
+require_license: false
+license_heartbeat_seconds: 60
+license_max_failures: 3
+
+respect_manual_open_profiles: true
+lock_dir: automation/local_locks
+log_dir: automation/logs
+draft_output_path: automation/output/comment_drafts.jsonl
+
+enable_grok_browser: false
+grok:
+  grok_url: https://x.com/i/grok
+  initial_wait_seconds: 5
+  response_timeout_seconds: 120
+  response_poll_seconds: 3
+  input_selectors:
+    - '@data-testid=DMComposerTextInput'
+    - 'tag:textarea'
+    - 'tag:div@@contenteditable=true'
+  send_selectors:
+    - '@data-testid=dmComposerSendButton'
+    - '@aria-label=Send'
+    - '@aria-label=发送'
+  response_selectors:
+    - 'tag:article'
+    - '@data-testid=cellInnerDiv'

@@ -1,0 +1,52 @@
+RUN_MODE: 1
+BIT_API_URL: http://127.0.0.1:54345
+GROUP_ID: ""
+WINDOW_COUNT: 3
+COMMENT_TEXTS: []
+
+FARMING_CONFIG:
+  keywords:
+    - AI
+    - Web3
+    - 日本株
+  prob_like: 0.5
+  prob_bookmark: 0.3
+  prob_reply: 0.2
+  prob_follow: 0.1
+  prob_retweet: 0.1
+  max_likes: 2
+  max_bookmarks: 1
+  max_replies: 1
+  max_follows: 1
+  max_retweets: 1
+  max_manual_searches: 3
+  switch_interval_min: 60.0
+  switch_interval_max: 180.0
+  read_delay_min: 5.0
+  read_delay_max: 12.0
+  pause_after_likes_min: 15
+  pause_after_likes_max: 28
+  pause_duration_min: 600.0
+  pause_duration_max: 1200.0
+
+TARGET_BOOST_CONFIG:
+  target_urls: []
+  prob_like: 1.0
+  prob_bookmark: 0.8
+  prob_retweet: 0.6
+  prob_reply: 0.8
+  prob_follow: 0.0
+  profile_interval_min: 10.0
+  profile_interval_max: 25.0
+  url_interval_min: 15.0
+  url_interval_max: 30.0
+  read_delay_min: 6.0
+  read_delay_max: 15.0
+
+POST_CONFIG:
+  txt_path: ""
+  img_folder: ""
+  img_count_min: 1
+  img_count_max: 4
+  profile_interval_min: 15.0
+  profile_interval_max: 30.0
