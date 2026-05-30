@@ -104,12 +104,18 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 group_id=query.get("group_id", [None])[0],
                 node_id=query.get("node_id", [None])[0],
                 limit=int(query.get("limit", ["500"])[0]),
+                include_inactive=query.get("include_inactive", ["0"])[0] in {"1", "true", "yes"},
             )
             write_json(self, 200, {"ok": True, "accounts": accounts, "count": len(accounts)})
             return
         if parsed.path == "/groups":
             query = parse_qs(parsed.query)
             groups = self.storage.list_groups(limit=int(query.get("limit", ["100"])[0]))
+            write_json(self, 200, {"ok": True, "groups": groups, "count": len(groups)})
+            return
+        if parsed.path == "/worker-sync-groups":
+            query = parse_qs(parsed.query)
+            groups = self.storage.list_worker_sync_groups(node_id=query.get("node_id", [None])[0])
             write_json(self, 200, {"ok": True, "groups": groups, "count": len(groups)})
             return
         if parsed.path == "/workers":
@@ -259,6 +265,44 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
             self.storage.set_group_alias(alias, group_id)
             write_json(self, 200, {"ok": True})
+            return
+        if parsed.path == "/groups/alias/delete":
+            alias = payload.get("alias", "")
+            if not alias:
+                write_json(self, 400, {"ok": False, "error": "missing alias"})
+                return
+            result = self.storage.delete_group_alias(alias)
+            write_json(self, 200, {"ok": True, **result})
+            return
+        if parsed.path == "/worker-sync-groups":
+            node_id = payload.get("node_id", "")
+            group_id = payload.get("group_id", "")
+            try:
+                result = self.storage.add_worker_sync_group(node_id, group_id)
+            except Exception as exc:
+                write_json(self, 400, {"ok": False, "error": str(exc)})
+                return
+            write_json(self, 200, {"ok": True, **result})
+            return
+        if parsed.path == "/worker-sync-groups/delete":
+            node_id = payload.get("node_id", "")
+            group_id = payload.get("group_id", "")
+            try:
+                result = self.storage.remove_worker_sync_group(node_id, group_id)
+            except Exception as exc:
+                write_json(self, 400, {"ok": False, "error": str(exc)})
+                return
+            write_json(self, 200, {"ok": True, **result})
+            return
+        if parsed.path.startswith("/accounts/") and parsed.path.endswith("/status"):
+            profile_id = parsed.path.strip("/").split("/")[1]
+            status = payload.get("status", "")
+            try:
+                result = self.storage.set_account_status(profile_id, status)
+            except Exception as exc:
+                write_json(self, 400, {"ok": False, "error": str(exc)})
+                return
+            write_json(self, 200, {"ok": True, **result})
             return
         if parsed.path == "/score-prompt":
             prompt = payload.get("prompt", "")

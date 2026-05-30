@@ -39,6 +39,13 @@ def load_config(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def save_config(path: str, config: Dict[str, Any]) -> None:
+    if yaml is None:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+
 def api_json(method: str, url: str, token: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     data = None
     headers = {"X-Automation-Token": token}
@@ -87,8 +94,9 @@ class LocalLock:
 
 
 class Worker:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], config_path: str = "automation_config.yaml"):
         self.config = config
+        self.config_path = config_path
         self.node_id = config.get("node_id", "local-node")
         self.label = config.get("label", self.node_id)
         self.central_api = config["central_api"].rstrip("/")
@@ -163,6 +171,7 @@ class Worker:
                     last_license_heartbeat = now
             sync_interval = int(self.config.get("sync_profiles_interval_seconds", 60))
             if self.config.get("sync_profiles_on_start", True) and now - last_profile_sync >= sync_interval:
+                self.refresh_assigned_sync_groups()
                 self.sync_profiles()
                 last_profile_sync = now
             job = self.next_job()
@@ -230,9 +239,34 @@ class Worker:
         }
         try:
             response = api_json("POST", f"{self.central_api}/accounts/sync", self.token, payload)
-            print(f"synced profiles: {response.get('count', 0)}")
+            print(
+                "synced profiles: "
+                f"{response.get('count', 0)} active, "
+                f"deactivated={response.get('deactivated', 0)}"
+            )
         except Exception as exc:
             print(f"profile sync upload failed: {exc}")
+
+    def refresh_assigned_sync_groups(self) -> None:
+        try:
+            response = api_json("GET", f"{self.central_api}/worker-sync-groups?node_id={self.node_id}", self.token)
+        except Exception as exc:
+            print(f"worker sync group refresh failed: {exc}")
+            return
+        assigned = [str(item.get("group_id") or "").strip() for item in response.get("groups", [])]
+        assigned = [item for item in assigned if item]
+        if not assigned:
+            return
+        existing = [str(item).strip() for item in (self.config.get("sync_group_ids") or []) if str(item).strip()]
+        merged = list(dict.fromkeys([*existing, *assigned]))
+        if merged == existing:
+            return
+        self.config["sync_group_ids"] = merged
+        try:
+            save_config(self.config_path, self.config)
+            print(f"updated local sync_group_ids from central: {','.join(assigned)}")
+        except Exception as exc:
+            print(f"save sync_group_ids failed: {exc}")
 
     def next_job(self) -> Optional[Dict[str, Any]]:
         url = f"{self.central_api}/worker/next?node_id={self.node_id}"
@@ -800,7 +834,7 @@ def main() -> None:
     parser.add_argument("--config", default="automation_config.yaml")
     args = parser.parse_args()
     config = load_config(args.config)
-    worker = Worker(config)
+    worker = Worker(config, args.config)
     worker.run_forever()
 
 

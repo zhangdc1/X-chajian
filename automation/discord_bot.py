@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -86,6 +87,15 @@ class CentralClient:
 
     def bind_group_alias(self, alias: str, group_id: str) -> Dict[str, Any]:
         return http_json("POST", f"{self.api}/groups/alias", self.token, {"alias": alias, "group_id": group_id})
+
+    def delete_group_alias(self, alias: str) -> Dict[str, Any]:
+        return http_json("POST", f"{self.api}/groups/alias/delete", self.token, {"alias": alias})
+
+    def add_worker_sync_group(self, node_id: str, group_id: str) -> Dict[str, Any]:
+        return http_json("POST", f"{self.api}/worker-sync-groups", self.token, {"node_id": node_id, "group_id": group_id})
+
+    def set_account_status(self, profile_id: str, status: str) -> Dict[str, Any]:
+        return http_json("POST", f"{self.api}/accounts/{profile_id}/status", self.token, {"status": status})
 
     def accounts(self, group_id: Optional[str] = None, node_id: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
         query = {"limit": str(limit)}
@@ -201,7 +211,7 @@ def parse_command(text: str) -> Dict[str, Any]:
 
     # Compatibility: "A组 绑定 测试 <group_id>" / "B组 绑定 测试 <group_id>"
     if len(parts) >= 4 and (parts[0].lower() in {"agroup", "group"} or parts[0].endswith("组")) and parts[1] in {"绑定", "bind", "alias"}:
-        return {"action": "bind_group_alias", "alias": parts[2], "group_id": parts[3]}
+        return {"action": "bind_group_alias", "alias": parts[2], "group_id": parts[3], "target_node_id": parts[4] if len(parts) >= 5 else None}
 
     cmd = parts[0].lower()
     args = parts[1:]
@@ -220,10 +230,28 @@ def parse_command(text: str) -> Dict[str, Any]:
         if not args or args[0] in {"list", "ls", "查", "列表"}:
             return {"action": "groups"}
         if args[0] in {"bind", "alias", "绑定", "别名"} and len(args) >= 3:
-            return {"action": "bind_group_alias", "alias": args[1], "group_id": args[2]}
+            return {
+                "action": "bind_group_alias",
+                "alias": args[1],
+                "group_id": args[2],
+                "target_node_id": pick_value(args[3:], {"电脑", "node", "node_id"}) or (args[3] if len(args) >= 4 else None),
+            }
         return {"action": "accounts", "group_id": args[0]}
     if cmd in {"bind", "alias", "绑定"} and len(args) >= 2:
-        return {"action": "bind_group_alias", "alias": args[0], "group_id": args[1]}
+        return {
+            "action": "bind_group_alias",
+            "alias": args[0],
+            "group_id": args[1],
+            "target_node_id": pick_value(args[2:], {"电脑", "node", "node_id"}) or (args[2] if len(args) >= 3 else None),
+        }
+    if cmd in {"解绑", "unbind", "删除绑定"} and args:
+        return {"action": "delete_group_alias", "alias": args[0]}
+    if cmd in {"同步分组", "添加同步分组"} and len(args) >= 2:
+        return {"action": "add_worker_sync_group", "target_node_id": args[0], "group_id": args[1]}
+    if cmd in {"停用账号", "禁用账号"} and args:
+        return {"action": "set_account_status", "profile_id": args[0], "status": "inactive"}
+    if cmd in {"恢复账号", "启用账号"} and args:
+        return {"action": "set_account_status", "profile_id": args[0], "status": "active"}
     if cmd in {"accounts", "account", "账号"}:
         group_id = pick_value(args, {"分组", "group", "group_id"}) or (args[0] if args else None)
         return {"action": "accounts", "group_id": group_id}
@@ -370,8 +398,11 @@ def build_help() -> str:
         "!查看版本\n"
         "!查看电脑状态\n"
         "!查看分组\n"
-        "!绑定 测试 4028808a9dddd516019df3bd0162204d\n"
+        "!绑定 测试 4028808a9dddd516019df3bd0162204d [PC-01]\n"
+        "!解绑 测试\n"
+        "!同步分组 PC-01 4028808a9dddd516019df3bd0162204d\n"
         "!查看账号 测试\n"
+        "!停用账号 profile_id / !恢复账号 profile_id\n"
         "!账号评分 测试\n"
         "!账号评分 测试 周计划\n"
         "!查看账号计划 测试\n"
@@ -423,14 +454,60 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
         lines = ["分组列表:"]
         for item in groups:
             alias = item.get("alias") or "-"
-            lines.append(f"- alias={alias} | group_id={item.get('group_id')} | accounts={item.get('account_count')}")
+            hint = ""
+            if int(item.get("account_count") or 0) == 0:
+                sync_nodes = item.get("sync_node_ids") or ""
+                hint = " | 提示=已绑定但未同步账号" if not sync_nodes else " | 提示=等待客户端同步"
+            lines.append(
+                f"- alias={alias} | group_id={item.get('group_id')} | "
+                f"accounts={item.get('account_count')} | inactive={item.get('inactive_count', 0)} | "
+                f"nodes={item.get('node_ids') or '-'} | sync={item.get('sync_node_ids') or '-'}{hint}"
+            )
         return "\n".join(lines), []
     if action == "bind_group_alias":
         alias, group_id = command.get("alias"), command.get("group_id")
         if not alias or not group_id:
-            return "用法: !bind 测试 group_id", []
+            return "用法: !绑定 测试 group_id [PC-01]", []
         client.bind_group_alias(alias, group_id)
-        return f"已绑定: {alias} -> {group_id}\n查询: !groups", []
+        node_id = command.get("target_node_id")
+        workers = client.workers().get("workers", [])
+        online_workers = [item for item in workers if item.get("status") == "online"]
+        if not node_id and len(online_workers) == 1:
+            node_id = online_workers[0].get("node_id")
+        if node_id:
+            client.add_worker_sync_group(str(node_id), group_id)
+            return (
+                f"已绑定: {alias} -> {group_id}\n"
+                f"已加入电脑 {node_id} 的同步分组，客户端下一轮同步后账号数会更新。\n"
+                f"查询: !查看分组 / !查看账号 {alias}"
+            ), []
+        if len(online_workers) > 1:
+            nodes = ", ".join(str(item.get("node_id")) for item in online_workers)
+            return (
+                f"已绑定: {alias} -> {group_id}\n"
+                f"检测到多台在线电脑，请指定同步电脑：!同步分组 PC-01 {group_id}\n"
+                f"在线电脑: {nodes}"
+            ), []
+        return f"已绑定: {alias} -> {group_id}\n当前没有在线电脑，稍后用 !同步分组 PC-01 {group_id} 加入同步。", []
+    if action == "delete_group_alias":
+        alias = command.get("alias")
+        if not alias:
+            return "用法: !解绑 测试", []
+        data = client.delete_group_alias(alias)
+        return f"已解绑别名: {alias} | count={data.get('aliases', 0)}", []
+    if action == "add_worker_sync_group":
+        node_id, group_id = command.get("target_node_id"), command.get("group_id")
+        if not node_id or not group_id:
+            return "用法: !同步分组 PC-01 group_id", []
+        client.add_worker_sync_group(node_id, group_id)
+        return f"已把分组加入 {node_id} 同步列表：{group_id}\n客户端下一轮同步后账号数会更新。", []
+    if action == "set_account_status":
+        profile_id, status = command.get("profile_id"), command.get("status")
+        if not profile_id or status not in {"active", "inactive"}:
+            return "用法: !停用账号 profile_id 或 !恢复账号 profile_id", []
+        data = client.set_account_status(profile_id, status)
+        cn = "恢复" if status == "active" else "停用"
+        return f"已{cn}账号: {profile_id} | 影响账号={data.get('accounts', 0)} 计划={data.get('plans', 0)} 任务={data.get('tasks', 0)}", []
     if action == "accounts":
         accounts = client.accounts(command.get("group_id")).get("accounts", [])
         if not accounts:
@@ -858,7 +935,32 @@ def main() -> None:
     if args.parse_only is not None:
         print(json.dumps(parse_command(args.parse_only), ensure_ascii=False, indent=2))
         return
-    asyncio.run(run_bot(load_config(args.config)))
+    lock_path = Path(args.config).resolve().with_suffix(".discord_bot.lock")
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except FileExistsError:
+        try:
+            old_pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+        except Exception:
+            old_pid = 0
+        if old_pid:
+            try:
+                os.kill(old_pid, 0)
+                print(f"Discord bot already running pid={old_pid}, exiting.")
+                return
+            except OSError:
+                pass
+        lock_path.unlink(missing_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    print(f"Discord bot process pid={os.getpid()}")
+    try:
+        asyncio.run(run_bot(load_config(args.config)))
+    finally:
+        lock_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

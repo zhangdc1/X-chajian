@@ -5,6 +5,14 @@ param(
 
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
+$running = Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*automation/discord_bot.py*" -or $_.CommandLine -like "*automation\discord_bot.py*" }
+if ($running) {
+    Write-Host "Discord Bot appears to be already running. Stop the existing process before starting another one." -ForegroundColor Yellow
+    $running | Select-Object ProcessId,CommandLine | Format-Table -AutoSize
+    exit 1
+}
+
 if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) {
     if (Get-Command "py" -ErrorAction SilentlyContinue) {
         $Python = "py"

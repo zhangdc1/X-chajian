@@ -98,8 +98,18 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 CREATE TABLE IF NOT EXISTS group_aliases (
     alias TEXT PRIMARY KEY,
     group_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_sync_groups (
+    node_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(node_id, group_id)
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -169,6 +179,8 @@ class Storage:
             self._ensure_column(conn, "account_plans", "score", "INTEGER")
             self._ensure_column(conn, "account_plans", "is_current", "INTEGER DEFAULT 1")
             self._ensure_column(conn, "scheduled_tasks", "last_error", "TEXT")
+            self._ensure_column(conn, "group_aliases", "status", "TEXT DEFAULT 'active'")
+            conn.execute("UPDATE group_aliases SET status = 'active' WHERE status IS NULL OR status = ''")
             self._ensure_default_score_prompt(conn)
             self.cancel_legacy_grok_score_jobs(conn)
 
@@ -334,6 +346,19 @@ class Storage:
         with self.connect() as conn:
             self._set_group_alias(conn, alias, group_id)
 
+    def delete_group_alias(self, alias: str) -> Dict[str, int]:
+        ts = now_ts()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE group_aliases
+                SET status = 'deleted', updated_at = ?
+                WHERE alias = ? AND status <> 'deleted'
+                """,
+                (ts, alias.strip()),
+            )
+        return {"aliases": int(cur.rowcount or 0)}
+
     def _set_group_alias(self, conn: sqlite3.Connection, alias: str, group_id: str) -> None:
         alias = (alias or "").strip()
         group_id = (group_id or "").strip()
@@ -346,17 +371,64 @@ class Storage:
             VALUES (?, ?, ?, ?)
             ON CONFLICT(alias) DO UPDATE SET
                 group_id = excluded.group_id,
+                status = 'active',
                 updated_at = excluded.updated_at
             """,
             (alias, group_id, ts, ts),
         )
+
+    def add_worker_sync_group(self, node_id: str, group_id: str) -> Dict[str, int]:
+        node_id = (node_id or "").strip()
+        group_id = (group_id or "").strip()
+        if not node_id or not group_id:
+            raise ValueError("missing node_id or group_id")
+        ts = now_ts()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_sync_groups (node_id, group_id, status, created_at, updated_at)
+                VALUES (?, ?, 'active', ?, ?)
+                ON CONFLICT(node_id, group_id) DO UPDATE SET
+                    status = 'active',
+                    updated_at = excluded.updated_at
+                """,
+                (node_id, group_id, ts, ts),
+            )
+        return {"sync_groups": 1}
+
+    def remove_worker_sync_group(self, node_id: str, group_id: str) -> Dict[str, int]:
+        ts = now_ts()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE worker_sync_groups
+                SET status = 'deleted', updated_at = ?
+                WHERE node_id = ? AND group_id = ? AND status <> 'deleted'
+                """,
+                (ts, (node_id or "").strip(), (group_id or "").strip()),
+            )
+        return {"sync_groups": int(cur.rowcount or 0)}
+
+    def list_worker_sync_groups(self, node_id: Optional[str] = None) -> list[Dict[str, Any]]:
+        sql = "SELECT * FROM worker_sync_groups WHERE status = 'active'"
+        params: list[Any] = []
+        if node_id:
+            sql += " AND node_id = ?"
+            params.append(node_id)
+        sql += " ORDER BY node_id, group_id"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
 
     def resolve_group_id(self, identifier: Optional[str]) -> Optional[str]:
         identifier = (identifier or "").strip()
         if not identifier:
             return None
         with self.connect() as conn:
-            row = conn.execute("SELECT group_id FROM group_aliases WHERE alias = ?", (identifier,)).fetchone()
+            row = conn.execute(
+                "SELECT group_id FROM group_aliases WHERE alias = ? AND status = 'active'",
+                (identifier,),
+            ).fetchone()
             if row:
                 return row["group_id"]
             row = conn.execute("SELECT 1 FROM accounts WHERE group_id = ? LIMIT 1", (identifier,)).fetchone()
@@ -371,7 +443,10 @@ class Storage:
                 WITH account_groups AS (
                     SELECT
                         group_id,
-                        COUNT(*) AS account_count,
+                        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS account_count,
+                        SUM(CASE WHEN status <> 'active' THEN 1 ELSE 0 END) AS inactive_count,
+                        GROUP_CONCAT(DISTINCT node_id) AS node_ids,
+                        MAX(last_seen) AS last_seen,
                         MAX(updated_at) AS updated_at
                     FROM accounts
                     WHERE COALESCE(group_id, '') <> ''
@@ -384,24 +459,58 @@ class Storage:
                         MAX(updated_at) AS updated_at
                     FROM group_aliases
                     WHERE COALESCE(group_id, '') <> ''
+                      AND status = 'active'
+                    GROUP BY group_id
+                ),
+                sync_groups AS (
+                    SELECT
+                        group_id,
+                        GROUP_CONCAT(DISTINCT node_id) AS sync_node_ids,
+                        MAX(updated_at) AS sync_updated_at
+                    FROM worker_sync_groups
+                    WHERE status = 'active'
                     GROUP BY group_id
                 )
                 SELECT
-                    ag.group_id AS group_id,
+                    COALESCE(ag.group_id, sg.group_id) AS group_id,
                     COALESCE(alg.alias, '') AS alias,
-                    ag.account_count AS account_count,
-                    MAX(COALESCE(ag.updated_at, 0), COALESCE(alg.updated_at, 0)) AS updated_at
+                    COALESCE(ag.account_count, 0) AS account_count,
+                    COALESCE(ag.inactive_count, 0) AS inactive_count,
+                    COALESCE(ag.node_ids, '') AS node_ids,
+                    COALESCE(ag.last_seen, 0) AS last_seen,
+                    COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    MAX(COALESCE(ag.updated_at, 0), COALESCE(alg.updated_at, 0), COALESCE(sg.sync_updated_at, 0)) AS updated_at
                 FROM account_groups ag
                 LEFT JOIN alias_groups alg ON alg.group_id = ag.group_id
+                LEFT JOIN sync_groups sg ON sg.group_id = ag.group_id
                 UNION ALL
                 SELECT
                     alg.group_id AS group_id,
                     COALESCE(alg.alias, '') AS alias,
                     0 AS account_count,
-                    alg.updated_at AS updated_at
+                    0 AS inactive_count,
+                    '' AS node_ids,
+                    0 AS last_seen,
+                    COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    MAX(COALESCE(alg.updated_at, 0), COALESCE(sg.sync_updated_at, 0)) AS updated_at
                 FROM alias_groups alg
                 LEFT JOIN account_groups ag ON ag.group_id = alg.group_id
+                LEFT JOIN sync_groups sg ON sg.group_id = alg.group_id
                 WHERE ag.group_id IS NULL
+                UNION ALL
+                SELECT
+                    sg.group_id AS group_id,
+                    '' AS alias,
+                    0 AS account_count,
+                    0 AS inactive_count,
+                    '' AS node_ids,
+                    0 AS last_seen,
+                    COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    sg.sync_updated_at AS updated_at
+                FROM sync_groups sg
+                LEFT JOIN account_groups ag ON ag.group_id = sg.group_id
+                LEFT JOIN alias_groups alg ON alg.group_id = sg.group_id
+                WHERE ag.group_id IS NULL AND alg.group_id IS NULL
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
@@ -975,10 +1084,13 @@ class Storage:
         group_id: Optional[str] = None,
         node_id: Optional[str] = None,
         limit: int = 500,
+        include_inactive: bool = False,
     ) -> list[Dict[str, Any]]:
         group_id = self.resolve_group_id(group_id)
-        sql = "SELECT * FROM accounts WHERE status = 'active'"
+        sql = "SELECT * FROM accounts WHERE 1=1"
         params: list[Any] = []
+        if not include_inactive:
+            sql += " AND status = 'active'"
         if group_id:
             sql += " AND group_id = ?"
             params.append(group_id)
@@ -1292,6 +1404,64 @@ class Storage:
         item = dict(row)
         item["meta"] = json.loads(item.pop("meta_json") or "{}")
         return item
+
+    def set_account_status(self, profile_id: str, status: str) -> Dict[str, int]:
+        if status not in {"active", "inactive"}:
+            raise ValueError(f"unsupported account status: {status}")
+        ts = now_ts()
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE accounts SET status = ?, updated_at = ? WHERE profile_id = ?",
+                (status, ts, profile_id),
+            )
+            if status == "inactive":
+                cleanup = self._cancel_account_pending_work(conn, profile_id, "account disabled by user", ts)
+            else:
+                cleanup = {"plans": 0, "tasks": 0, "jobs": 0}
+        return {"accounts": int(cur.rowcount or 0), **cleanup}
+
+    def _cancel_account_pending_work(
+        self,
+        conn: sqlite3.Connection,
+        profile_id: str,
+        reason: str,
+        ts: Optional[int] = None,
+    ) -> Dict[str, int]:
+        ts = ts or now_ts()
+        plan_rows = conn.execute(
+            """
+            SELECT id FROM account_plans
+            WHERE account_id = ?
+              AND COALESCE(is_current, 1) = 1
+              AND status NOT IN ('deleted', 'superseded', 'account_inactive')
+            """,
+            (profile_id,),
+        ).fetchall()
+        plan_ids = [int(row["id"]) for row in plan_rows]
+        if not plan_ids:
+            return {"plans": 0, "tasks": 0, "jobs": 0}
+        placeholders = ",".join("?" for _ in plan_ids)
+        conn.execute(
+            f"""
+            UPDATE account_plans
+            SET status = 'account_inactive', is_current = 0, updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [ts, *plan_ids],
+        )
+        task_cur = conn.execute(
+            f"""
+            UPDATE scheduled_tasks
+            SET status = 'cancelled_account_inactive',
+                last_error = ?,
+                updated_at = ?
+            WHERE plan_id IN ({placeholders})
+              AND status IN ('scheduled', 'paused', 'dispatched')
+            """,
+            [reason, ts, *plan_ids],
+        )
+        jobs = self._cancel_jobs_for_plan_ids(conn, plan_ids, reason, ts)
+        return {"plans": len(plan_ids), "tasks": int(task_cur.rowcount or 0), "jobs": jobs}
 
     def list_scheduled_tasks(
         self,

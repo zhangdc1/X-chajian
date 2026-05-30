@@ -1035,6 +1035,7 @@ class AppGUI(tk.Toplevel):
         tab_post = ttk.Frame(notebook)  # 新增发帖模式Tab
         tab_comments = ttk.Frame(notebook)
         tab_score_plan = ttk.Frame(notebook)
+        tab_group_admin = ttk.Frame(notebook)
 
         notebook.add(tab_basic, text="⚙️ 基础设置")
         notebook.add(tab_farm, text="🌾 养号全量配置")
@@ -1042,6 +1043,7 @@ class AppGUI(tk.Toplevel):
         notebook.add(tab_post, text="📝 发帖矩阵配置")
         notebook.add(tab_comments, text="💭 文本评论库")
         notebook.add(tab_score_plan, text="📊 账号评分计划")
+        notebook.add(tab_group_admin, text="🖥️ 分组账号管理")
 
         self.build_basic_tab(tab_basic)
         self.build_farm_tab(tab_farm)
@@ -1049,6 +1051,7 @@ class AppGUI(tk.Toplevel):
         self.build_post_tab(tab_post)
         self.build_comments_tab(tab_comments)
         self.build_score_plan_tab(tab_score_plan)
+        self.build_group_admin_tab(tab_group_admin)
         log_holder = tab_basic
 
         frame_log = tk.LabelFrame(log_holder, text="📝 运行日志")
@@ -1520,6 +1523,208 @@ class AppGUI(tk.Toplevel):
 
     def selected_score_task_ids(self):
         return [int(item) for item in self.score_task_tree.selection()]
+
+    def build_group_admin_tab(self, parent):
+        paned = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        top = ttk.Frame(paned)
+        bottom = ttk.Frame(paned)
+        paned.add(top, weight=2)
+        paned.add(bottom, weight=3)
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, weight=1)
+        top.rowconfigure(1, weight=1)
+        bottom.columnconfigure(0, weight=1)
+        bottom.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(top)
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(toolbar, text="刷新", command=self.refresh_group_admin).pack(side=tk.LEFT, padx=4)
+        ttk.Label(toolbar, text="别名").pack(side=tk.LEFT, padx=(16, 4))
+        self.admin_alias_entry = ttk.Entry(toolbar, width=14)
+        self.admin_alias_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Label(toolbar, text="分组ID").pack(side=tk.LEFT, padx=(8, 4))
+        self.admin_group_entry = ttk.Entry(toolbar, width=34)
+        self.admin_group_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Label(toolbar, text="电脑").pack(side=tk.LEFT, padx=(8, 4))
+        self.admin_node_entry = ttk.Entry(toolbar, width=12)
+        self.admin_node_entry.insert(0, "PC-01")
+        self.admin_node_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="绑定并同步", command=self.admin_bind_group).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="解绑别名", command=self.admin_unbind_alias).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="添加同步分组", command=self.admin_add_sync_group).pack(side=tk.LEFT, padx=4)
+
+        worker_box = ttk.LabelFrame(top, text="电脑")
+        worker_box.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        worker_box.rowconfigure(0, weight=1)
+        worker_box.columnconfigure(0, weight=1)
+        self.admin_worker_tree = ttk.Treeview(worker_box, columns=("node", "label", "status", "groups"), show="headings", height=7)
+        for col, text, width in [("node", "电脑", 90), ("label", "名称", 140), ("status", "状态", 80), ("groups", "同步分组", 420)]:
+            self.admin_worker_tree.heading(col, text=text)
+            self.admin_worker_tree.column(col, width=width)
+        worker_scroll = ttk.Scrollbar(worker_box, orient=tk.VERTICAL, command=self.admin_worker_tree.yview)
+        self.admin_worker_tree.configure(yscrollcommand=worker_scroll.set)
+        self.admin_worker_tree.grid(row=0, column=0, sticky="nsew")
+        worker_scroll.grid(row=0, column=1, sticky="ns")
+
+        group_box = ttk.LabelFrame(top, text="分组")
+        group_box.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
+        group_box.rowconfigure(0, weight=1)
+        group_box.columnconfigure(0, weight=1)
+        self.admin_group_tree = ttk.Treeview(group_box, columns=("alias", "group", "active", "inactive", "nodes", "sync"), show="headings", height=7)
+        for col, text, width in [
+            ("alias", "别名", 110),
+            ("group", "分组ID", 250),
+            ("active", "账号", 60),
+            ("inactive", "停用", 60),
+            ("nodes", "账号电脑", 110),
+            ("sync", "同步电脑", 110),
+        ]:
+            self.admin_group_tree.heading(col, text=text)
+            self.admin_group_tree.column(col, width=width)
+        group_scroll = ttk.Scrollbar(group_box, orient=tk.VERTICAL, command=self.admin_group_tree.yview)
+        self.admin_group_tree.configure(yscrollcommand=group_scroll.set)
+        self.admin_group_tree.grid(row=0, column=0, sticky="nsew")
+        group_scroll.grid(row=0, column=1, sticky="ns")
+        self.admin_group_tree.bind("<<TreeviewSelect>>", self.on_admin_group_select)
+
+        account_toolbar = ttk.Frame(bottom)
+        account_toolbar.grid(row=0, column=0, sticky="ew", pady=(6, 4))
+        ttk.Button(account_toolbar, text="刷新账号", command=self.refresh_admin_accounts).pack(side=tk.LEFT, padx=4)
+        ttk.Button(account_toolbar, text="停用所选账号", command=lambda: self.admin_set_account_status("inactive")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(account_toolbar, text="恢复所选账号", command=lambda: self.admin_set_account_status("active")).pack(side=tk.LEFT, padx=4)
+
+        account_box = ttk.LabelFrame(bottom, text="账号")
+        account_box.grid(row=1, column=0, sticky="nsew")
+        account_box.rowconfigure(0, weight=1)
+        account_box.columnconfigure(0, weight=1)
+        self.admin_account_tree = ttk.Treeview(account_box, columns=("profile", "name", "group", "node", "status", "seen"), show="headings", height=10, selectmode="extended")
+        for col, text, width in [
+            ("profile", "Profile", 250),
+            ("name", "名称", 160),
+            ("group", "分组ID", 250),
+            ("node", "电脑", 90),
+            ("status", "状态", 80),
+            ("seen", "最后同步", 150),
+        ]:
+            self.admin_account_tree.heading(col, text=text)
+            self.admin_account_tree.column(col, width=width)
+        account_scroll = ttk.Scrollbar(account_box, orient=tk.VERTICAL, command=self.admin_account_tree.yview)
+        self.admin_account_tree.configure(yscrollcommand=account_scroll.set)
+        self.admin_account_tree.grid(row=0, column=0, sticky="nsew")
+        account_scroll.grid(row=0, column=1, sticky="ns")
+        self.after(1000, self.refresh_group_admin)
+
+    def refresh_group_admin(self):
+        def work():
+            return {
+                "workers": central_api_request("GET", "/workers").get("workers", []),
+                "groups": central_api_request("GET", "/groups").get("groups", []),
+            }
+
+        def done(data):
+            for tree in (self.admin_worker_tree, self.admin_group_tree):
+                for item in tree.get_children():
+                    tree.delete(item)
+            for worker in data.get("workers", []):
+                meta = worker.get("meta") or {}
+                groups = ",".join(meta.get("sync_group_ids") or [])
+                self.admin_worker_tree.insert("", tk.END, iid=str(worker.get("node_id")), values=(worker.get("node_id"), worker.get("label"), worker.get("status"), groups))
+            for group in data.get("groups", []):
+                group_id = str(group.get("group_id"))
+                self.admin_group_tree.insert("", tk.END, iid=group_id, values=(group.get("alias") or "-", group_id, group.get("account_count", 0), group.get("inactive_count", 0), group.get("node_ids") or "-", group.get("sync_node_ids") or "-"))
+            logger.info("分组账号管理已刷新。")
+
+        self.run_score_api_async(work, done, lambda exc: messagebox.showerror("错误", f"刷新分组账号失败: {exc}"))
+
+    def on_admin_group_select(self, _event=None):
+        selected = self.admin_group_tree.selection()
+        if not selected:
+            return
+        group_id = selected[0]
+        values = self.admin_group_tree.item(group_id, "values")
+        if values:
+            self.admin_alias_entry.delete(0, tk.END)
+            self.admin_alias_entry.insert(0, "" if values[0] == "-" else values[0])
+            self.admin_group_entry.delete(0, tk.END)
+            self.admin_group_entry.insert(0, group_id)
+        self.refresh_admin_accounts()
+
+    def refresh_admin_accounts(self):
+        group_id = self.admin_group_entry.get().strip()
+        if not group_id:
+            selected = self.admin_group_tree.selection()
+            group_id = selected[0] if selected else ""
+        if not group_id:
+            return
+
+        def work():
+            return central_api_request("GET", "/accounts", query={"group_id": group_id, "limit": 500, "include_inactive": "1"})
+
+        def done(data):
+            for item in self.admin_account_tree.get_children():
+                self.admin_account_tree.delete(item)
+            for account in data.get("accounts", []):
+                seen = "-"
+                try:
+                    seen = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(account.get("last_seen") or 0)))
+                except Exception:
+                    pass
+                self.admin_account_tree.insert("", tk.END, iid=str(account.get("profile_id")), values=(account.get("profile_id"), account.get("profile_name"), account.get("group_id"), account.get("node_id"), account.get("status"), seen))
+
+        self.run_score_api_async(work, done, lambda exc: logger.warning(f"刷新账号管理失败: {exc}"))
+
+    def admin_bind_group(self):
+        alias = self.admin_alias_entry.get().strip()
+        group_id = self.admin_group_entry.get().strip()
+        node_id = self.admin_node_entry.get().strip()
+        if not alias or not group_id:
+            messagebox.showwarning("提示", "请填写别名和分组ID。")
+            return
+
+        def work():
+            central_api_request("POST", "/groups/alias", {"alias": alias, "group_id": group_id})
+            if node_id:
+                central_api_request("POST", "/worker-sync-groups", {"node_id": node_id, "group_id": group_id})
+            return True
+
+        self.run_score_api_async(work, lambda _: self.refresh_group_admin(), lambda exc: messagebox.showerror("错误", f"绑定失败: {exc}"))
+
+    def admin_unbind_alias(self):
+        alias = self.admin_alias_entry.get().strip()
+        if not alias:
+            messagebox.showwarning("提示", "请填写或选择别名。")
+            return
+        self.run_score_api_async(
+            lambda: central_api_request("POST", "/groups/alias/delete", {"alias": alias}),
+            lambda _: self.refresh_group_admin(),
+            lambda exc: messagebox.showerror("错误", f"解绑失败: {exc}"),
+        )
+
+    def admin_add_sync_group(self):
+        node_id = self.admin_node_entry.get().strip()
+        group_id = self.admin_group_entry.get().strip()
+        if not node_id or not group_id:
+            messagebox.showwarning("提示", "请填写电脑和分组ID。")
+            return
+        self.run_score_api_async(
+            lambda: central_api_request("POST", "/worker-sync-groups", {"node_id": node_id, "group_id": group_id}),
+            lambda _: self.refresh_group_admin(),
+            lambda exc: messagebox.showerror("错误", f"添加同步分组失败: {exc}"),
+        )
+
+    def admin_set_account_status(self, status):
+        ids = list(self.admin_account_tree.selection())
+        if not ids:
+            messagebox.showwarning("提示", "请先选择账号。")
+            return
+
+        def work():
+            for profile_id in ids:
+                central_api_request("POST", f"/accounts/{profile_id}/status", {"status": status})
+            return True
+
+        self.run_score_api_async(work, lambda _: self.refresh_admin_accounts(), lambda exc: messagebox.showerror("错误", f"账号操作失败: {exc}"))
 
     def refresh_score_plan_tasks(self):
         plan_id = self.selected_score_plan_id()
