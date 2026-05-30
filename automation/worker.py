@@ -161,7 +161,7 @@ class Worker:
                 if now - last_license_heartbeat >= interval:
                     self.check_license_heartbeat()
                     last_license_heartbeat = now
-            sync_interval = int(self.config.get("sync_profiles_interval_seconds", 300))
+            sync_interval = int(self.config.get("sync_profiles_interval_seconds", 60))
             if self.config.get("sync_profiles_on_start", True) and now - last_profile_sync >= sync_interval:
                 self.sync_profiles()
                 last_profile_sync = now
@@ -225,6 +225,7 @@ class Worker:
             return
         payload = {
             "node_id": self.node_id,
+            "synced_group_ids": [str(item) for item in group_ids],
             "accounts": all_profiles,
         }
         try:

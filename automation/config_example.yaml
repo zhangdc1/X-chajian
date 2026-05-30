@@ -14,7 +14,7 @@ max_concurrency: 1
 bit_api_url: http://127.0.0.1:54345
 sync_group_ids: []
 sync_profiles_on_start: true
-sync_profiles_interval_seconds: 300
+sync_profiles_interval_seconds: 60
 
 # Existing card-key system. Leave empty during local skeleton testing, then
 # fill before production packaging.

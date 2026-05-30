@@ -565,6 +565,19 @@ class Storage:
         )
         return {"queued_cancelled": len(queued_ids), "leased_requested": len(leased_ids)}
 
+    def _cancel_jobs_for_plan_ids(
+        self,
+        conn: sqlite3.Connection,
+        plan_ids: list[int],
+        reason: str,
+        ts: Optional[int] = None,
+    ) -> int:
+        total = 0
+        for plan_id in plan_ids:
+            result = self._cancel_jobs_for_plan(conn, plan_id, reason, ts)
+            total += int(result.get("queued_cancelled", 0)) + int(result.get("leased_requested", 0))
+        return total
+
     def add_job_run(self, job_id: int, node_id: str, status: str, message: str) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -818,13 +831,24 @@ class Storage:
             result.append(item)
         return result
 
-    def upsert_accounts(self, node_id: str, accounts: list[Dict[str, Any]]) -> int:
+    def upsert_accounts(
+        self,
+        node_id: str,
+        accounts: list[Dict[str, Any]],
+        synced_group_ids: Optional[list[str]] = None,
+    ) -> Dict[str, int]:
         ts = now_ts()
+        seen_profile_ids: set[str] = set()
+        group_ids = {str(item).strip() for item in (synced_group_ids or []) if str(item).strip()}
         with self.connect() as conn:
             for account in accounts:
                 profile_id = str(account.get("profile_id") or account.get("id") or "").strip()
                 if not profile_id:
                     continue
+                seen_profile_ids.add(profile_id)
+                group_id = str(account.get("group_id") or account.get("groupId") or "").strip()
+                if group_id:
+                    group_ids.add(group_id)
                 conn.execute(
                     """
                     INSERT INTO accounts (
@@ -844,7 +868,7 @@ class Storage:
                     (
                         profile_id,
                         account.get("profile_name") or account.get("name") or "",
-                        account.get("group_id") or account.get("groupId") or "",
+                        group_id,
                         node_id,
                         account.get("x_username") or account.get("username") or "",
                         json.dumps(account.get("meta", account), ensure_ascii=False),
@@ -862,9 +886,89 @@ class Storage:
                     self._set_group_alias(
                         conn,
                         str(group_name),
-                        str(account.get("group_id") or account.get("groupId") or ""),
+                        group_id,
                     )
-        return len(accounts)
+            deactivated = 0
+            cancelled_jobs = 0
+            cancelled_tasks = 0
+            cancelled_plans = 0
+            if group_ids:
+                placeholders = ",".join("?" for _ in group_ids)
+                params: list[Any] = [node_id, *group_ids]
+                keep_clause = ""
+                if seen_profile_ids:
+                    keep_placeholders = ",".join("?" for _ in seen_profile_ids)
+                    keep_clause = f" AND profile_id NOT IN ({keep_placeholders})"
+                    params.extend(sorted(seen_profile_ids))
+                rows = conn.execute(
+                    f"""
+                    SELECT profile_id FROM accounts
+                    WHERE node_id = ?
+                      AND status = 'active'
+                      AND group_id IN ({placeholders})
+                      {keep_clause}
+                    """,
+                    params,
+                ).fetchall()
+                stale_ids = [str(row["profile_id"]) for row in rows]
+                if stale_ids:
+                    stale_placeholders = ",".join("?" for _ in stale_ids)
+                    conn.execute(
+                        f"""
+                        UPDATE accounts
+                        SET status = 'inactive', updated_at = ?
+                        WHERE profile_id IN ({stale_placeholders})
+                        """,
+                        [ts, *stale_ids],
+                    )
+                    deactivated = len(stale_ids)
+                    plan_rows = conn.execute(
+                        f"""
+                        SELECT id FROM account_plans
+                        WHERE account_id IN ({stale_placeholders})
+                          AND plan_type = 'score_plan'
+                          AND COALESCE(is_current, 1) = 1
+                          AND status NOT IN ('deleted', 'cancelled_by_new_plan')
+                        """,
+                        stale_ids,
+                    ).fetchall()
+                    plan_ids = [int(row["id"]) for row in plan_rows]
+                    if plan_ids:
+                        plan_placeholders = ",".join("?" for _ in plan_ids)
+                        conn.execute(
+                            f"""
+                            UPDATE account_plans
+                            SET status = 'account_inactive', is_current = 0, updated_at = ?
+                            WHERE id IN ({plan_placeholders})
+                            """,
+                            [ts, *plan_ids],
+                        )
+                        cancelled_plans = len(plan_ids)
+                        task_cur = conn.execute(
+                            f"""
+                            UPDATE scheduled_tasks
+                            SET status = 'cancelled_account_inactive',
+                                last_error = 'account removed from synced group',
+                                updated_at = ?
+                            WHERE plan_id IN ({plan_placeholders})
+                              AND status IN ('scheduled', 'paused', 'dispatched')
+                            """,
+                            [ts, *plan_ids],
+                        )
+                        cancelled_tasks = int(task_cur.rowcount or 0)
+                        cancelled_jobs = self._cancel_jobs_for_plan_ids(
+                            conn,
+                            plan_ids,
+                            "account removed from synced group",
+                            ts,
+                        )
+        return {
+            "count": len(seen_profile_ids),
+            "deactivated": deactivated,
+            "cancelled_plans": cancelled_plans,
+            "cancelled_tasks": cancelled_tasks,
+            "cancelled_jobs": cancelled_jobs,
+        }
 
     def list_accounts(
         self,

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tkinter as tk
+import threading
 import time
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -82,6 +83,7 @@ class Launcher(tk.Tk):
         self.geometry("520x330")
         self.resizable(False, False)
         self.config_data = load_config()
+        self.start_button: ttk.Button | None = None
         self.vars = {
             "card_number": tk.StringVar(value=str(self.config_data.get("card_number") or "")),
             "central_api": tk.StringVar(value=str(self.config_data.get("central_api") or "")),
@@ -109,7 +111,8 @@ class Launcher(tk.Tk):
         hint.grid(row=len(fields), column=0, columnspan=2, sticky=tk.W, pady=(8, 14))
         btns = ttk.Frame(frame)
         btns.grid(row=len(fields) + 1, column=0, columnspan=2, sticky=tk.E)
-        ttk.Button(btns, text="保存并启动Worker", command=self.save_validate_start).pack(side=tk.LEFT, padx=4)
+        self.start_button = ttk.Button(btns, text="保存并启动Worker", command=self.save_validate_start)
+        self.start_button.pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="打开面板", command=self.open_panel).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="退出", command=self.destroy).pack(side=tk.LEFT, padx=4)
         frame.columnconfigure(1, weight=1)
@@ -141,14 +144,24 @@ class Launcher(tk.Tk):
         if missing:
             messagebox.showwarning("缺少配置", "请填写：" + "、".join(missing))
             return
+        if self.start_button:
+            self.start_button.configure(state=tk.DISABLED, text="验证中...")
+        threading.Thread(target=self._validate_and_start_worker, args=(config,), daemon=True).start()
+
+    def _validate_and_start_worker(self, config: Dict[str, Any]) -> None:
         guard = LicenseGuard(config.get("card_number"), config.get("app_version", "1.0.0"))
         result = guard.validate_once()
-        if not result.ok:
-            messagebox.showerror("卡密验证失败", result.message)
+        self.after(0, lambda: self._finish_validate_and_start(config, result.ok, result.message))
+
+    def _finish_validate_and_start(self, config: Dict[str, Any], ok: bool, message: str) -> None:
+        if self.start_button:
+            self.start_button.configure(state=tk.NORMAL, text="保存并启动Worker")
+        if not ok:
+            messagebox.showerror("卡密验证失败", message)
             return
         save_config(config)
-        messagebox.showinfo("验证成功", "卡密验证成功，正在启动 Worker。")
         self.start_worker()
+        messagebox.showinfo("验证成功", "卡密验证成功，Worker 已在后台启动。")
 
     def start_worker(self) -> None:
         cmd = exe_path("XBotSupervisor.exe", "automation.supervisor")

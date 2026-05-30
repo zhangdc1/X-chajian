@@ -893,6 +893,9 @@ class AppGUI(tk.Toplevel):
         self.geometry("1180x900")
         self.minsize(980, 720)
         self.config_path = "config.yaml"
+        self._score_task_refresh_after = None
+        self._score_task_loading_plan_id = None
+        self._score_plan_busy = False
 
         self.load_config()
         self.build_ui()
@@ -1315,86 +1318,6 @@ class AppGUI(tk.Toplevel):
         lower = ttk.Frame(score_paned)
         score_paned.add(upper, weight=3)
         score_paned.add(lower, weight=2)
-        parent = upper
-        top = ttk.LabelFrame(parent, text="中央评分提示词")
-        top.pack(fill=tk.BOTH, expand=False, padx=10, pady=8)
-        self.score_prompt_text = scrolledtext.ScrolledText(top, height=8)
-        self.score_prompt_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
-        btns = ttk.Frame(top)
-        btns.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Button(btns, text="刷新提示词", command=self.refresh_score_prompt).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="保存提示词到中央", command=self.save_score_prompt).pack(side=tk.LEFT, padx=4)
-
-        mid = ttk.LabelFrame(parent, text="账号评分计划")
-        mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        filters = ttk.Frame(mid)
-        filters.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(filters, text="分组/别名:").pack(side=tk.LEFT)
-        self.score_group_entry = ttk.Entry(filters, width=24)
-        self.score_group_entry.insert(0, self.config.get("GROUP_ID", ""))
-        self.score_group_entry.pack(side=tk.LEFT, padx=4)
-        self.show_history_plans_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filters, text="显示历史失效计划", variable=self.show_history_plans_var).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="刷新计划", command=self.refresh_score_plans).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="生成所选计划调度", command=self.schedule_selected_score_plan).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="暂停所选计划", command=lambda: self.set_selected_score_plan_status("pause")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="恢复所选计划", command=lambda: self.set_selected_score_plan_status("resume")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="删除所选计划", command=lambda: self.set_selected_score_plan_status("delete")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="暂停所选任务", command=lambda: self.set_selected_schedule_status("pause")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(filters, text="恢复所选任务", command=lambda: self.set_selected_schedule_status("resume")).pack(side=tk.LEFT, padx=4)
-
-        columns = ("plan", "account", "score", "status", "tasks")
-        self.score_plan_tree = ttk.Treeview(mid, columns=columns, show="headings", height=7, selectmode="extended")
-        for col, text, width in [
-            ("plan", "计划ID", 70),
-            ("account", "账号/Profile", 220),
-            ("score", "评分", 70),
-            ("status", "状态", 90),
-            ("tasks", "任务统计", 220),
-        ]:
-            self.score_plan_tree.heading(col, text=text)
-            self.score_plan_tree.column(col, width=width)
-        plan_tree_frame = ttk.Frame(mid)
-        plan_tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        plan_scrollbar = ttk.Scrollbar(plan_tree_frame, orient=tk.VERTICAL, command=self.score_plan_tree.yview)
-        self.score_plan_tree.configure(yscrollcommand=plan_scrollbar.set)
-        self.score_plan_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        plan_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.score_plan_tree.bind("<<TreeviewSelect>>", lambda _e: self.refresh_score_plan_tasks())
-
-        task_frame = ttk.LabelFrame(lower, text="所选计划任务表")
-        task_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        task_cols = ("task", "time", "status", "mode", "metrics")
-        self.score_task_tree = ttk.Treeview(task_frame, columns=task_cols, show="headings", height=8, selectmode="extended")
-        for col, text, width in [
-            ("task", "任务ID", 70),
-            ("time", "执行时间", 150),
-            ("status", "状态", 80),
-            ("mode", "模式", 60),
-            ("metrics", "指标", 520),
-        ]:
-            self.score_task_tree.heading(col, text=text)
-            self.score_task_tree.column(col, width=width)
-        task_tree_frame = ttk.Frame(task_frame)
-        task_tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        task_scrollbar = ttk.Scrollbar(task_tree_frame, orient=tk.VERTICAL, command=self.score_task_tree.yview)
-        self.score_task_tree.configure(yscrollcommand=task_scrollbar.set)
-        self.score_task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        task_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        task_actions = ttk.Frame(lower)
-        task_actions.pack(fill=tk.X, padx=10, pady=4)
-        ttk.Button(task_actions, text="暂停所选任务", command=lambda: self.set_selected_schedule_status("pause")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(task_actions, text="恢复所选任务", command=lambda: self.set_selected_schedule_status("resume")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(task_actions, text="取消所选任务", command=lambda: self.set_selected_schedule_status("cancel")).pack(side=tk.LEFT, padx=4)
-        self.after(800, self.refresh_score_prompt)
-
-    def build_score_plan_tab(self, parent):
-        score_paned = ttk.PanedWindow(parent, orient=tk.VERTICAL)
-        score_paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        upper = ttk.Frame(score_paned)
-        lower = ttk.Frame(score_paned)
-        score_paned.add(upper, weight=3)
-        score_paned.add(lower, weight=2)
 
         upper.rowconfigure(1, weight=1)
         upper.columnconfigure(0, weight=1)
@@ -1454,7 +1377,7 @@ class AppGUI(tk.Toplevel):
         self.score_plan_tree.configure(yscrollcommand=plan_scrollbar.set)
         self.score_plan_tree.grid(row=0, column=0, sticky="nsew")
         plan_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.score_plan_tree.bind("<<TreeviewSelect>>", lambda _e: self.refresh_score_plan_tasks())
+        self.score_plan_tree.bind("<<TreeviewSelect>>", self.on_score_plan_select)
 
         task_frame = ttk.LabelFrame(lower, text="所选计划任务表")
         task_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=8)
@@ -1491,33 +1414,81 @@ class AppGUI(tk.Toplevel):
         task_xscrollbar.grid(row=1, column=0, sticky="ew")
         self.after(800, self.refresh_score_prompt)
 
+    def run_score_api_async(self, work, on_success=None, on_error=None):
+        def runner():
+            try:
+                result = work()
+                self.after(0, lambda: on_success(result) if on_success else None)
+            except Exception as exc:
+                self.after(0, lambda exc=exc: on_error(exc) if on_error else logger.warning(f"账号评分计划请求失败: {exc}"))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def set_score_plan_busy(self, busy, message=""):
+        self._score_plan_busy = busy
+        if message:
+            logger.info(message)
+
+    def on_score_plan_select(self, _event=None):
+        if self._score_task_refresh_after:
+            self.after_cancel(self._score_task_refresh_after)
+        self._score_task_refresh_after = self.after(250, self.refresh_score_plan_tasks)
+
     def refresh_score_prompt(self):
-        try:
-            data = central_api_request("GET", "/score-prompt")
+        if not hasattr(self, "score_prompt_text"):
+            return
+        self.set_score_plan_busy(True, "正在刷新账号评分提示词...")
+
+        def work():
+            return central_api_request("GET", "/score-prompt")
+
+        def done(data):
             self.score_prompt_text.delete("1.0", tk.END)
             self.score_prompt_text.insert(tk.END, data.get("prompt", ""))
+            self.set_score_plan_busy(False)
             logger.info("账号评分提示词已从中央刷新。")
-        except Exception as exc:
+
+        def failed(exc):
+            self.set_score_plan_busy(False)
             logger.warning(f"刷新账号评分提示词失败: {exc}")
 
+        self.run_score_api_async(work, done, failed)
+
     def save_score_prompt(self):
-        try:
-            prompt = self.score_prompt_text.get("1.0", tk.END).strip()
+        prompt = self.score_prompt_text.get("1.0", tk.END).strip()
+        self.set_score_plan_busy(True, "正在保存账号评分提示词...")
+
+        def work():
             central_api_request("POST", "/score-prompt", {"prompt": prompt})
+            return True
+
+        def done(_):
+            self.set_score_plan_busy(False)
             messagebox.showinfo("成功", "账号评分提示词已保存到中央。")
-        except Exception as exc:
+
+        def failed(exc):
+            self.set_score_plan_busy(False)
             messagebox.showerror("错误", f"保存提示词失败: {exc}")
 
+        self.run_score_api_async(work, done, failed)
+
     def refresh_score_plans(self):
-        try:
-            group_id = self.score_group_entry.get().strip()
-            data = central_api_request(
+        group_id = self.score_group_entry.get().strip()
+        current_only = "0" if self.show_history_plans_var.get() else "1"
+        self.set_score_plan_busy(True, "正在刷新账号评分计划...")
+
+        def work():
+            return central_api_request(
                 "GET",
                 "/score-plans",
-                query={"group_id": group_id, "limit": 200, "current_only": "0" if self.show_history_plans_var.get() else "1"},
+                query={"group_id": group_id, "limit": 200, "current_only": current_only},
             )
+
+        def done(data):
             for item in self.score_plan_tree.get_children():
                 self.score_plan_tree.delete(item)
+            for item in self.score_task_tree.get_children():
+                self.score_task_tree.delete(item)
             for plan in data.get("plans", []):
                 summary = plan.get("task_summary") or {}
                 task_text = " ".join(f"{k}:{v}" for k, v in summary.items() if k != "total") or "无"
@@ -1527,9 +1498,14 @@ class AppGUI(tk.Toplevel):
                     iid=str(plan.get("id")),
                     values=(plan.get("id"), plan.get("account_id"), plan.get("score") or "-", plan.get("status"), task_text),
                 )
+            self.set_score_plan_busy(False)
             logger.info(f"已刷新账号评分计划: {data.get('count', 0)} 条")
-        except Exception as exc:
+
+        def failed(exc):
+            self.set_score_plan_busy(False)
             messagebox.showerror("错误", f"刷新账号计划失败: {exc}")
+
+        self.run_score_api_async(work, done, failed)
 
     def selected_score_plan_id(self):
         selected = self.score_plan_tree.selection()
@@ -1549,8 +1525,20 @@ class AppGUI(tk.Toplevel):
         plan_id = self.selected_score_plan_id()
         if not plan_id:
             return
-        try:
-            data = central_api_request("GET", f"/score-plans/{plan_id}")
+        if self._score_task_loading_plan_id == plan_id:
+            return
+        self._score_task_loading_plan_id = plan_id
+        for item in self.score_task_tree.get_children():
+            self.score_task_tree.delete(item)
+        self.score_task_tree.insert("", tk.END, iid=f"loading_{plan_id}", values=("", "加载中...", "", "", ""))
+
+        def work():
+            return central_api_request("GET", f"/score-plans/{plan_id}")
+
+        def done(data):
+            self._score_task_loading_plan_id = None
+            if self.selected_score_plan_id() != plan_id:
+                return
             for item in self.score_task_tree.get_children():
                 self.score_task_tree.delete(item)
             for task in data.get("tasks", []):
@@ -1563,20 +1551,35 @@ class AppGUI(tk.Toplevel):
                     iid=str(task.get("id")),
                     values=(task.get("id"), time.strftime("%Y-%m-%d %H:%M", time.localtime(int(task.get("run_at")))), task.get("status"), payload.get("mode"), metric_text),
                 )
-        except Exception as exc:
+
+        def failed(exc):
+            self._score_task_loading_plan_id = None
+            for item in self.score_task_tree.get_children():
+                self.score_task_tree.delete(item)
             logger.warning(f"刷新计划任务失败: {exc}")
+
+        self.run_score_api_async(work, done, failed)
 
     def schedule_selected_score_plan(self):
         plan_id = self.selected_score_plan_id()
         if not plan_id:
             messagebox.showwarning("提示", "请先选择一个账号计划。")
             return
-        try:
-            data = central_api_request("POST", f"/score-plans/{plan_id}/schedule", {"max_days": 31})
+        self.set_score_plan_busy(True, "正在生成所选计划调度...")
+
+        def work():
+            return central_api_request("POST", f"/score-plans/{plan_id}/schedule", {"max_days": 31})
+
+        def done(data):
+            self.set_score_plan_busy(False)
             messagebox.showinfo("成功", f"已生成调度任务 {data.get('scheduled_count', 0)} 个。")
             self.refresh_score_plan_tasks()
-        except Exception as exc:
+
+        def failed(exc):
+            self.set_score_plan_busy(False)
             messagebox.showerror("错误", f"生成调度失败: {exc}")
+
+        self.run_score_api_async(work, done, failed)
 
     def set_selected_score_plan_status(self, action):
         plan_ids = self.selected_score_plan_ids()
@@ -1587,25 +1590,45 @@ class AppGUI(tk.Toplevel):
             ok = messagebox.askyesno("确认删除", f"确认删除所选 {len(plan_ids)} 个计划吗？未执行任务会被取消。")
             if not ok:
                 return
-        try:
+        self.set_score_plan_busy(True, f"正在处理 {len(plan_ids)} 个计划...")
+
+        def work():
             for plan_id in plan_ids:
                 central_api_request("POST", f"/score-plans/{plan_id}/{action}", {})
+            return True
+
+        def done(_):
+            self.set_score_plan_busy(False)
             self.refresh_score_plans()
             self.refresh_score_plan_tasks()
-        except Exception as exc:
+
+        def failed(exc):
+            self.set_score_plan_busy(False)
             messagebox.showerror("错误", f"计划操作失败: {exc}")
+
+        self.run_score_api_async(work, done, failed)
 
     def set_selected_schedule_status(self, action):
         task_ids = self.selected_score_task_ids()
         if not task_ids:
             messagebox.showwarning("提示", "请先选择一个调度任务。")
             return
-        try:
+        self.set_score_plan_busy(True, f"正在处理 {len(task_ids)} 个任务...")
+
+        def work():
             for task_id in task_ids:
                 central_api_request("POST", f"/scheduled-tasks/{task_id}/{action}", {})
+            return True
+
+        def done(_):
+            self.set_score_plan_busy(False)
             self.refresh_score_plan_tasks()
-        except Exception as exc:
+
+        def failed(exc):
+            self.set_score_plan_busy(False)
             messagebox.showerror("错误", f"操作失败: {exc}")
+
+        self.run_score_api_async(work, done, failed)
 
 
 if __name__ == "__main__":

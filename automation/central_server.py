@@ -241,8 +241,15 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if not node_id:
                 write_json(self, 400, {"ok": False, "error": "missing node_id"})
                 return
-            count = self.storage.upsert_accounts(node_id, payload.get("accounts", []))
-            write_json(self, 200, {"ok": True, "count": count})
+            result = self.storage.upsert_accounts(
+                node_id,
+                payload.get("accounts", []),
+                synced_group_ids=payload.get("synced_group_ids") or [],
+            )
+            if isinstance(result, dict):
+                write_json(self, 200, {"ok": True, **result})
+            else:
+                write_json(self, 200, {"ok": True, "count": result})
             return
         if parsed.path == "/groups/alias":
             alias = payload.get("alias", "")
