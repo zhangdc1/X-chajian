@@ -20,6 +20,14 @@ except ModuleNotFoundError as exc:
         "powershell -ExecutionPolicy Bypass -File deployment/install_worker_deps.ps1"
     ) from exc
 
+from automation.license_guard import LicenseGuard
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def load_yaml(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -29,8 +37,25 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def save_yaml(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+
+
+def validate_tool_license() -> None:
+    automation_config = load_yaml(Path("automation_config.yaml"))
+    if not automation_config:
+        if getattr(sys, "frozen", False):
+            raise RuntimeError("未找到 automation_config.yaml，无法验证卡密")
+        return
+    if not automation_config.get("require_license", False):
+        return
+    card_number = str(automation_config.get("card_number") or "").strip()
+    if not card_number:
+        raise RuntimeError("未配置卡密，请先运行 launch_xbot.bat 完成卡密验证")
+    result = LicenseGuard(card_number, str(automation_config.get("app_version") or "1.0.0")).validate_once()
+    if not result.ok:
+        raise RuntimeError(f"卡密验证失败：{result.message}")
 
 
 def build_runtime_config(base_config: Dict[str, Any], mode: int, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,10 +121,16 @@ def validate_runtime_config(config: Dict[str, Any], mode: int) -> None:
 
     if mode == 3:
         post = config.get("POST_CONFIG") or {}
-        if not post.get("txt_path"):
-            missing.append("发帖矩阵配置 / 文本内容 TXT 文件")
-        if not post.get("img_folder"):
-            missing.append("发帖矩阵配置 / 媒体库文件夹")
+        txt_path = str(post.get("txt_path") or "").strip()
+        img_folder = str(post.get("img_folder") or "").strip()
+        if not txt_path:
+            missing.append("模式三文本库未配置")
+        elif not Path(txt_path).is_file():
+            missing.append(f"模式三文本库不存在：{txt_path}")
+        if not img_folder:
+            missing.append("模式三媒体照片库未配置")
+        elif not Path(img_folder).is_dir():
+            missing.append(f"模式三媒体照片库不存在：{img_folder}")
 
     if missing:
         raise RuntimeError(
@@ -143,14 +174,26 @@ class LegacyRunTracker:
         self.lines.append(clean)
         self.lines = self.lines[-80:]
         if self.should_emit(clean):
-            print(json.dumps({"legacy_log": clean}, ensure_ascii=False), flush=True)
+            print(json.dumps({"legacy_log": clean}, ensure_ascii=True), flush=True)
         if "拉起成功" in clean:
             self.started_profiles += 1
         if f"开始模式 {self.mode}" in clean or f"开始模式{self.mode}" in clean:
             self.entered_mode = True
-        if ">>> 循环" in clean or "启动【集体多链接冲贴模式】" in clean or "启动【自动发帖模式】" in clean:
+        if (
+            ">>> 循环" in clean
+            or "启动【集体多链接冲贴模式】" in clean
+            or "启动【自动发帖模式】" in clean
+            or "冲贴线程已启动" in clean
+            or "正在执行目标" in clean
+            or "发帖任务" in clean
+        ):
             self.entered_business_loop = True
-        if "任务全部正常结束" in clean or "本窗口任务目标已全部达成" in clean or "所有账号的发帖任务已圆满结束" in clean:
+        if (
+            "任务全部正常结束" in clean
+            or "本窗口任务目标已全部达成" in clean
+            or "所有账号的发帖任务已圆满结束" in clean
+            or "分配的所有冲贴任务已完成" in clean
+        ):
             self.completed = True
         if "任务已被手动中止" in clean:
             self.stopped = True
@@ -169,6 +212,10 @@ class LegacyRunTracker:
             ok = False
             status = "stopped"
             reason = "任务被停止"
+        elif self.errors and not self.completed:
+            ok = False
+            status = "failed"
+            reason = self.errors[-1]
         elif not self.entered_mode:
             ok = False
             status = "not_started"
@@ -177,10 +224,6 @@ class LegacyRunTracker:
             ok = False
             status = "not_really_running"
             reason = "模式一没有进入养号循环，通常是账号未登录、页面异常或窗口未正常打开"
-        elif self.errors and not self.completed:
-            ok = False
-            status = "failed"
-            reason = self.errors[-1]
         return {
             "ok": ok,
             "status": status,
@@ -222,6 +265,11 @@ class LegacyRunTracker:
             ">>> 循环",
             "进度 ->",
             "执行了：",
+            "冲贴线程已启动",
+            "正在执行目标",
+            "转帖成功",
+            "评论成功",
+            "分配的所有冲贴任务已完成",
             "潮汐休眠",
             "休息结束",
             "任务目标已全部达成",
@@ -274,7 +322,7 @@ def run_legacy_mode(config: Dict[str, Any], log_file: str = "") -> Dict[str, Any
     newtkmain.app_instance = None
     newtkmain.bot_worker()
     result = tracker.result()
-    print(json.dumps({"legacy_result": result}, ensure_ascii=False))
+    print(json.dumps({"legacy_result": result}, ensure_ascii=True))
     if not result["ok"]:
         raise RuntimeError(result["reason"] or f"原脚本模式{mode}没有正常完成")
     return result
@@ -287,13 +335,31 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--log-file", default="")
     parser.add_argument("--check-import", action="store_true")
+    parser.add_argument("--check-smart-comment", action="store_true")
     args = parser.parse_args()
 
     if args.check_import:
         import_legacy_module()
         print("legacy import ok")
         return
+    if args.check_smart_comment:
+        from automation.model_client import OpenAICompatibleClient, app_root, load_model_config
+        from automation.smart_comment import smart_comment_config
 
+        model_config = load_model_config()
+        client = OpenAICompatibleClient(model_config)
+        data = {
+            "app_root": str(app_root()),
+            "model_enabled": bool(model_config.get("enabled")),
+            "model_ready": client.ready(),
+            "base_url": client.base_url,
+            "model": client.model,
+            "smart_comment": smart_comment_config(),
+        }
+        print(json.dumps(data, ensure_ascii=True), flush=True)
+        return
+
+    validate_tool_license()
     payload = json.loads(args.payload_json or "{}")
     config_path = Path(args.config)
     base_config = load_yaml(config_path)
@@ -309,3 +375,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

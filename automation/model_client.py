@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import request
@@ -11,7 +12,18 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def app_root() -> Path:
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        if exe_dir.parent.name.lower() == "runtime":
+            return exe_dir.parent.parent
+        if exe_dir.name.lower() == "runtime":
+            return exe_dir.parent
+        return exe_dir
+    return Path(__file__).resolve().parents[1]
+
+
+PROJECT_ROOT = app_root()
 
 
 def load_model_config(path: str | Path = "model_config.yaml") -> Dict[str, Any]:

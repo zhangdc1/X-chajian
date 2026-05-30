@@ -5,10 +5,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from automation.model_client import OpenAICompatibleClient, load_model_config
+from automation.model_client import OpenAICompatibleClient, app_root, load_model_config
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = app_root()
 DEFAULT_OUTPUT = PROJECT_ROOT / "automation" / "output" / "comment_drafts.jsonl"
 
 

@@ -21,8 +21,11 @@ sync_profiles_interval_seconds: 300
 card_number: ""
 app_version: "1.0.0"
 require_license: false
+license_heartbeat_enabled: false
 license_heartbeat_seconds: 60
 license_max_failures: 3
+worker_autorestart: true
+worker_restart_interval_seconds: 10
 
 respect_manual_open_profiles: true
 lock_dir: automation/local_locks

@@ -47,8 +47,17 @@ def api_json(method: str, url: str, token: str, payload: Optional[Dict[str, Any]
         headers["Content-Type"] = "application/json; charset=utf-8"
     req = request.Request(url, data=data, headers=headers, method=method)
     opener = request.build_opener(request.ProxyHandler({}))
-    with opener.open(req, timeout=20) as res:
-        return json.loads(res.read().decode("utf-8"))
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            with opener.open(req, timeout=20) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 class LocalLock:
@@ -105,6 +114,27 @@ class Worker:
             parents=True,
             exist_ok=True,
         )
+        self.pending_reports_path = Path(config.get("task_dir", "automation/tasks")) / "pending_job_reports.jsonl"
+
+    @staticmethod
+    def app_root() -> Path:
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            if exe_dir.parent.name.lower() == "runtime":
+                return exe_dir.parent.parent
+            if exe_dir.name.lower() == "runtime":
+                return exe_dir.parent
+            return exe_dir
+        return Path(__file__).resolve().parents[1]
+
+    def tool_command(self, exe_name: str, script_name: str) -> list[str]:
+        script = Path(__file__).resolve().parent / script_name
+        if getattr(sys, "frozen", False):
+            exe_path = self.app_root() / "runtime" / Path(exe_name).stem / exe_name
+            if exe_path.exists():
+                return [str(exe_path)]
+            raise RuntimeError(f"发布包缺少运行组件：{exe_path}")
+        return [sys.executable, str(script)]
 
     def run_forever(self) -> None:
         if not self.config.get("worker_enabled", True):
@@ -122,10 +152,11 @@ class Worker:
         last_profile_sync = 0.0
         while True:
             now = time.time()
+            self.flush_pending_reports()
             if now - last_heartbeat >= 30:
                 self.heartbeat()
                 last_heartbeat = now
-            if self.config.get("require_license", False):
+            if self.config.get("require_license", False) and self.config.get("license_heartbeat_enabled", False):
                 interval = int(self.config.get("license_heartbeat_seconds", 60) or 60)
                 if now - last_license_heartbeat >= interval:
                     self.check_license_heartbeat()
@@ -136,7 +167,16 @@ class Worker:
                 last_profile_sync = now
             job = self.next_job()
             if job:
-                self.handle_job(job)
+                try:
+                    self.handle_job(job)
+                except Exception as exc:
+                    job_id = job.get("id", "?")
+                    print(f"worker job loop recovered after job {job_id} failed unexpectedly: {exc}")
+                    try:
+                        self.log_job(int(job_id), "error", f"Worker 捕获到未处理异常，已保持在线：{exc}")
+                        self.fail(int(job_id), str(exc))
+                    except Exception as report_exc:
+                        print(f"failed to report unexpected job error: {report_exc}")
             else:
                 time.sleep(poll)
 
@@ -251,11 +291,18 @@ class Worker:
             result.setdefault("local_log_path", str(log_path))
             self.log_job(job["id"], "running", f"任务执行完成，准备回传结果：{result.get('status', 'ok')}")
             self.audit.finish_job(job, "completed", result=result)
-            self.complete(job["id"], result)
+            if not self.report_job_status("complete", job["id"], result=result):
+                self.queue_pending_report("complete", job["id"], result=result)
+                self.audit.append_log(
+                    log_path,
+                    "pending_report",
+                    "任务本地已完成，但中央回传失败，已加入待补报队列；不会把任务改为失败。",
+                )
         except Exception as exc:
             self.log_job(job["id"], "error", f"任务执行失败：{exc}")
             self.audit.finish_job(job, "failed", error=str(exc))
-            self.fail(job["id"], str(exc))
+            if not self.report_job_status("fail", job["id"], error=str(exc)):
+                self.queue_pending_report("fail", job["id"], error=str(exc))
         finally:
             self.lock.release(lock_path)
             self._current_log_path = None
@@ -322,11 +369,13 @@ class Worker:
         period = payload.get("period", "weekly")
         account_id = payload.get("account_id", "")
         profile_id = payload.get("profile_id") or account_id
-        prompt = self.fetch_score_prompt()
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            prompt = self.fetch_score_prompt()
         self.log_job(
             int(payload.get("_job_id", 0) or 0),
             "running",
-            "评分任务已读取中央评分提示词，本地 payload 不允许覆盖",
+            "评分任务使用中央创建时写入的提示词快照；payload 为空时才回源读取中央提示词",
         )
         if self.config.get("enable_grok_browser", False):
             self.log_job(
@@ -430,12 +479,9 @@ class Worker:
             f"准备执行原脚本模式{mode} | 当前任务ID: {job_id} | 超时上限: {timeout_seconds}秒",
         )
         self.log_job(job_id, "running", f"准备执行原脚本模式{mode}，参数将读取现有 config.yaml 并应用本次指令覆盖")
-        runner = Path(__file__).resolve().parent / "legacy_runner.py"
         log_path = str(payload.get("_local_log_path") or "")
         self.start_gui_log_viewer(job_id, log_path)
-        command = [
-            sys.executable,
-            str(runner),
+        command = self.tool_command("XBotLegacyRunner.exe", "legacy_runner.py") + [
             "--mode",
             str(mode),
             "--payload-json",
@@ -448,7 +494,7 @@ class Worker:
         env.setdefault("PYTHONUTF8", "1")
         proc = subprocess.Popen(
             command,
-            cwd=str(Path(__file__).resolve().parents[1]),
+            cwd=str(self.app_root()),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -560,13 +606,17 @@ class Worker:
     def start_gui_log_viewer(self, job_id: int, log_path: str) -> None:
         if not log_path or not self.config.get("open_gui_for_legacy", True):
             return
-        viewer = Path(__file__).resolve().parent / "gui_log_viewer.py"
-        command = [sys.executable, str(viewer), "--log-file", log_path, "--job-id", str(job_id)]
+        command = self.tool_command("XBotGuiLogViewer.exe", "gui_log_viewer.py") + [
+            "--log-file",
+            log_path,
+            "--job-id",
+            str(job_id),
+        ]
         try:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             subprocess.Popen(
                 command,
-                cwd=str(Path(__file__).resolve().parents[1]),
+                cwd=str(self.app_root()),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
@@ -653,6 +703,81 @@ class Worker:
             self.token,
             {"node_id": self.node_id, "error": error},
         )
+
+    def report_job_status(
+        self,
+        action: str,
+        job_id: int,
+        result: Optional[Dict[str, Any]] = None,
+        error: str = "",
+    ) -> bool:
+        try:
+            if action == "complete":
+                self.complete(job_id, result or {})
+            elif action == "fail":
+                self.fail(job_id, error)
+            else:
+                raise ValueError(f"unsupported report action: {action}")
+            return True
+        except Exception as exc:
+            print(f"job {action} upload failed for job {job_id}: {exc}")
+            return False
+
+    def queue_pending_report(
+        self,
+        action: str,
+        job_id: int,
+        result: Optional[Dict[str, Any]] = None,
+        error: str = "",
+    ) -> None:
+        self.pending_reports_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "created_at": int(time.time()),
+            "node_id": self.node_id,
+            "job_id": job_id,
+            "action": action,
+            "result": result or {},
+            "error": error,
+        }
+        with open(self.pending_reports_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def flush_pending_reports(self) -> None:
+        path = self.pending_reports_path
+        if not path.exists():
+            return
+        try:
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except Exception as exc:
+            print(f"pending report load failed: {exc}")
+            return
+        if not records:
+            path.unlink(missing_ok=True)
+            return
+        remaining = []
+        for index, record in enumerate(records):
+            action = str(record.get("action") or "")
+            job_id = int(record.get("job_id") or 0)
+            if not job_id or action not in {"complete", "fail"}:
+                continue
+            ok = self.report_job_status(
+                action,
+                job_id,
+                result=record.get("result") or {},
+                error=str(record.get("error") or ""),
+            )
+            if not ok:
+                remaining.append(record)
+                remaining.extend(records[index + 1 :])
+                break
+        if remaining:
+            tmp_path = path.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for record in remaining:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            tmp_path.replace(path)
+        else:
+            path.unlink(missing_ok=True)
 
     def log_job(self, job_id: int, status: str, message: str) -> None:
         if not job_id:

@@ -451,6 +451,15 @@ class Storage:
         self._maybe_update_scheduled_task(job_id, "completed", "")
 
     def fail_job(self, job_id: int, node_id: str, error: str) -> None:
+        current = self.get_job(job_id)
+        if current and current.get("status") == "completed":
+            self.add_job_run(
+                job_id,
+                node_id,
+                "ignored_late_fail",
+                f"忽略迟到失败上报，任务已完成：{error}",
+            )
+            return
         self._finish_job(job_id, node_id, "failed", None, error)
         self._maybe_update_scheduled_task(job_id, "failed", error)
 

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tkinter as tk
+import time
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Dict
@@ -40,8 +41,21 @@ def load_config() -> Dict[str, Any]:
                 "sync_group_ids: []\n",
                 encoding="utf-8",
             )
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        broken = CONFIG_PATH.with_suffix(f".broken_{time.strftime('%Y%m%d_%H%M%S')}.yaml")
+        try:
+            CONFIG_PATH.replace(broken)
+        except Exception:
+            pass
+        template = Path("automation_config.example.yaml")
+        if template.exists():
+            CONFIG_PATH.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        raise RuntimeError(f"automation_config.yaml 格式错误，已尝试备份到 {broken}: {exc}") from exc
 
 
 def save_config(config: Dict[str, Any]) -> None:
@@ -114,8 +128,11 @@ class Launcher(tk.Tk):
         config.setdefault("worker_enabled", True)
         config.setdefault("bit_api_url", "http://127.0.0.1:54345")
         config.setdefault("poll_interval_seconds", 5)
+        config.setdefault("license_heartbeat_enabled", False)
         config.setdefault("license_heartbeat_seconds", 60)
         config.setdefault("license_max_failures", 3)
+        config.setdefault("worker_autorestart", True)
+        config.setdefault("worker_restart_interval_seconds", 10)
         return config
 
     def save_validate_start(self) -> None:
@@ -134,8 +151,8 @@ class Launcher(tk.Tk):
         self.start_worker()
 
     def start_worker(self) -> None:
-        cmd = exe_path("XBotWorker.exe", "automation.worker")
-        subprocess.Popen([*cmd, "--config", str(CONFIG_PATH)], cwd=os.getcwd(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+        cmd = exe_path("XBotSupervisor.exe", "automation.supervisor")
+        subprocess.Popen([*cmd, "--config", str(CONFIG_PATH)], cwd=os.getcwd(), creationflags=0)
 
     def open_panel(self) -> None:
         cmd = exe_path("XBotPanel.exe", "automation.panel_entry")

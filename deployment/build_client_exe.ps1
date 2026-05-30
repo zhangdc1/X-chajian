@@ -36,6 +36,7 @@ if ($UsePyArmor) {
     }
     & $pyarmor.Source gen -O $obfRoot `
         "automation\worker.py" `
+        "automation\supervisor.py" `
         "automation\launcher.py" `
         "automation\panel_entry.py" `
         "automation\license_guard.py" `
@@ -77,7 +78,11 @@ function Build-Exe {
         "--name", $Name,
         "--hidden-import", "DrissionPage",
         "--hidden-import", "Crypto",
-        "--hidden-import", "yaml"
+        "--hidden-import", "yaml",
+        "--hidden-import", "pystray",
+        "--hidden-import", "PIL",
+        "--hidden-import", "PIL.Image",
+        "--hidden-import", "PIL.ImageDraw"
     )
     if ($Windowed) {
         $args += "--windowed"
@@ -87,6 +92,9 @@ function Build-Exe {
 }
 
 Build-Exe -Name "XBotWorker" -Entry "automation\worker.py"
+Build-Exe -Name "XBotSupervisor" -Entry "automation\supervisor.py" -Windowed
+Build-Exe -Name "XBotLegacyRunner" -Entry "automation\legacy_runner.py"
+Build-Exe -Name "XBotGuiLogViewer" -Entry "automation\gui_log_viewer.py" -Windowed
 Build-Exe -Name "XBotLauncher" -Entry "automation\launcher.py" -Windowed
 Build-Exe -Name "XBotPanel" -Entry "automation\panel_entry.py" -Windowed
 
@@ -97,7 +105,7 @@ if (Test-Path $clientDir) {
 }
 New-Item -ItemType Directory -Force -Path $clientDir | Out-Null
 
-foreach ($name in @("XBotWorker", "XBotLauncher", "XBotPanel")) {
+foreach ($name in @("XBotWorker", "XBotSupervisor", "XBotLegacyRunner", "XBotGuiLogViewer", "XBotLauncher", "XBotPanel")) {
     Copy-Item -LiteralPath (Join-Path $distRoot $name) -Destination (Join-Path $clientDir "runtime\$name") -Recurse -Force
 }
 
@@ -111,16 +119,18 @@ Copy-Item -LiteralPath "deployment\launch_xbot.bat" -Destination (Join-Path $cli
 New-Item -ItemType Directory -Force -Path `
     (Join-Path $clientDir "logs"), `
     (Join-Path $clientDir "tasks"), `
-    (Join-Path $clientDir "output") | Out-Null
+    (Join-Path $clientDir "output"), `
+    (Join-Path $clientDir "automation\data") | Out-Null
 
-(Get-Content -LiteralPath (Join-Path $clientDir "automation_config.yaml") -Raw) `
+(Get-Content -LiteralPath (Join-Path $clientDir "automation_config.yaml") -Raw -Encoding UTF8) `
     -replace 'require_license: false', 'require_license: true' `
+    -replace 'license_heartbeat_enabled: true', 'license_heartbeat_enabled: false' `
     -replace 'log_dir: automation/logs', 'log_dir: logs' `
     -replace 'draft_output_path: automation/output/comment_drafts.jsonl', 'draft_output_path: output/comment_drafts.jsonl' `
     -replace 'lock_dir: automation/local_locks', 'lock_dir: tasks/local_locks' |
     Set-Content -LiteralPath (Join-Path $clientDir "automation_config.yaml") -Encoding UTF8
 
-& powershell -ExecutionPolicy Bypass -File "deployment\verify_client_release.ps1" -Path $clientDir
+& powershell -ExecutionPolicy Bypass -File "deployment\verify_client_release.ps1" -Path $clientDir -Python $Python
 
 $zipPath = Join-Path $releaseRoot "xbot-client_$Version.zip"
 if (Test-Path $zipPath) {

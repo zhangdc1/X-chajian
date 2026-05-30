@@ -1249,11 +1249,17 @@ class AppGUI(tk.Toplevel):
         def select_txt_file():
             path = filedialog.askopenfilename(title="选择帖子文本库",
                                               filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
-            if path: self.post_txt_entry.delete(0, tk.END); self.post_txt_entry.insert(0, path)
+            if path:
+                self.post_txt_entry.delete(0, tk.END)
+                self.post_txt_entry.insert(0, path)
+                self.save_config(silent=True)
 
         def select_img_folder():
             path = filedialog.askdirectory(title="选择媒体素材文件夹")
-            if path: self.post_img_entry.delete(0, tk.END); self.post_img_entry.insert(0, path)
+            if path:
+                self.post_img_entry.delete(0, tk.END)
+                self.post_img_entry.insert(0, path)
+                self.save_config(silent=True)
 
         f_file = ttk.Frame(parent)
         f_file.pack(fill=tk.X, padx=20, pady=15)
@@ -1262,12 +1268,14 @@ class AppGUI(tk.Toplevel):
         self.post_txt_entry = ttk.Entry(f_file, width=45)
         self.post_txt_entry.insert(0, pc.get("txt_path", ""))
         self.post_txt_entry.grid(row=0, column=1, padx=10)
+        self.post_txt_entry.bind("<FocusOut>", lambda _e: self.save_config(silent=True))
         ttk.Button(f_file, text="浏览...", command=select_txt_file).grid(row=0, column=2)
 
         ttk.Label(f_file, text="媒体库(图片文件夹):").grid(row=1, column=0, sticky=tk.W, pady=10)
         self.post_img_entry = ttk.Entry(f_file, width=45)
         self.post_img_entry.insert(0, pc.get("img_folder", ""))
         self.post_img_entry.grid(row=1, column=1, padx=10)
+        self.post_img_entry.bind("<FocusOut>", lambda _e: self.save_config(silent=True))
         ttk.Button(f_file, text="浏览...", command=select_img_folder).grid(row=1, column=2)
 
         lf_logic = ttk.LabelFrame(parent, text="调度参数")
