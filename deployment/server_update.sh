@@ -8,7 +8,14 @@ cd "$APP_DIR"
 
 echo "== backup =="
 mkdir -p backups
-tar -czf "backups/controller_db_$(date +%Y%m%d_%H%M%S).tar.gz" automation/data discord_config.yaml 2>/dev/null || true
+STAMP="$(date +%Y%m%d_%H%M%S)"
+CURRENT_COMMIT="$(git rev-parse HEAD)"
+echo "$CURRENT_COMMIT" > "backups/last_commit_before_update_${STAMP}.txt"
+git tag -f "server-backup-before-update-${STAMP}" "$CURRENT_COMMIT"
+tar -czf "backups/controller_db_${STAMP}.tar.gz" automation/data discord_config.yaml scheduler_config.yaml model_config.yaml 2>/dev/null || true
+echo "backup tag: server-backup-before-update-${STAMP}"
+echo "rollback command if needed:"
+echo "  cd $APP_DIR && git reset --hard $CURRENT_COMMIT && systemctl restart xbot-controller && (systemctl restart xbot-discord || pkill -f automation/discord_bot.py)"
 
 echo "== git pull =="
 git pull origin "$BRANCH"
@@ -37,4 +44,3 @@ fi
 curl -fsS http://127.0.0.1:8766/health || true
 echo
 echo "server update done"
-

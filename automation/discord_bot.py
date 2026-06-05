@@ -222,6 +222,8 @@ def parse_command(text: str) -> Dict[str, Any]:
         return {"action": "confirm_execute", "confirm_id": to_int(args[0]) if args else None}
     if cmd in {"help", "h", "?", "帮助", "菜单", "命令"}:
         return {"action": "help"}
+    if cmd in {"帮助全部", "完整帮助", "高级帮助", "管理帮助", "helpall", "fullhelp"}:
+        return {"action": "help_full"}
     if text in {"查看电脑状态", "电脑状态", "查看状态"} or cmd in {"status", "workers", "电脑", "状态"}:
         return {"action": "workers"}
     if text in {"查看分组", "查询分组", "分组列表", "查看绑定", "查询绑定", "绑定列表", "别名列表"}:
@@ -394,34 +396,73 @@ def short_json(data: Dict[str, Any], limit: int = 300) -> str:
 
 def build_help() -> str:
     return (
-        f"X-bot 中文指令 {BOT_VERSION}：\n"
-        "!帮助\n"
-        "!查看版本\n"
+        f"X-bot 常用指令 {BOT_VERSION}\n"
+        "\n"
+        "一、日常执行\n"
+        "!模式一 测试              养号\n"
+        "!模式二 测试 链接=https://x.com/xxx/status/123   冲贴，最高优先级\n"
+        "!模式三 测试              发帖\n"
+        "!确认执行 123             确认高风险动作\n"
+        "\n"
+        "二、账号评分计划\n"
+        "!账号评分 测试 周计划      生成7天账号提升计划\n"
+        "!查看账号计划 测试        查看当前有效评分计划\n"
+        "!生成账号调度 测试        将评分计划转为自动任务\n"
+        "!查看调度 测试            查看自动任务\n"
+        "\n"
+        "三、电脑/分组/账号\n"
         "!查看电脑状态\n"
         "!查看分组\n"
-        "!绑定 测试 4028808a9dddd516019df3bd0162204d [PC-01]\n"
-        "!解绑 测试\n"
-        "!同步分组 PC-01 4028808a9dddd516019df3bd0162204d\n"
         "!查看账号 测试\n"
+        "!绑定 测试 group_id [PC-01]\n"
+        "\n"
+        "四、排障\n"
+        "!查看任务\n"
+        "!查看任务详情 123\n"
+        "!查看日志 123\n"
+        "\n"
+        "更多管理命令请输入：!帮助全部"
+    )
+
+
+def build_full_help() -> str:
+    return (
+        f"X-bot 完整指令 {BOT_VERSION}\n"
+        "\n"
+        "常用：\n"
+        "!帮助 / !帮助全部 / !查看版本\n"
+        "!查看电脑状态 / !查看分组 / !查看账号 测试\n"
+        "\n"
+        "分组与账号管理：\n"
+        "!绑定 测试 group_id [PC-01]\n"
+        "!解绑 测试\n"
+        "!同步分组 PC-01 group_id\n"
         "!停用账号 profile_id / !恢复账号 profile_id\n"
-        "!账号评分 测试\n"
-        "!账号评分 测试 周计划\n"
+        "\n"
+        "账号评分计划：\n"
+        "!账号评分 测试 [日计划|周计划|月计划]\n"
         "!查看账号计划 测试\n"
         "!生成账号调度 测试\n"
+        "\n"
+        "原 Grok/草稿计划兼容入口（不推荐日常使用，保留给旧数据排查）：\n"
         "!查看计划 测试\n"
         "!查看草稿计划 测试\n"
-        "!生成调度 测试  （把已有Grok计划转成调度）\n"
+        "!生成调度 测试\n"
         "!确认计划 123\n"
+        "\n"
+        "执行模式：\n"
         "!模式一 测试\n"
         "!模式二 测试 链接=https://x.com/xxx/status/123\n"
         "!模式三 测试\n"
+        "\n"
+        "任务和日志：\n"
         "!查看任务\n"
         "!查看任务详情 123\n"
         "!查看日志 123\n"
         "!查看调度 测试\n"
-        "!确认执行 123  （确认自然语言识别出来的高风险动作）\n"
+        "\n"
         "自然语言示例：现在开始养号 / 帮测试组跑模式一 / 开始冲这个帖子 https://x.com/...\n"
-        "也兼容：@Bot A组 绑定 测试 4028808a9dddd516019df3bd0162204d"
+        "兼容旧格式：@Bot A组 绑定 测试 group_id"
     )
 
 
@@ -437,6 +478,8 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
         return f"当前运行版本: {BOT_VERSION}", []
     if action == "help":
         return build_help(), []
+    if action == "help_full":
+        return build_full_help(), []
     if action == "workers":
         workers = client.workers().get("workers", [])
         if not workers:
