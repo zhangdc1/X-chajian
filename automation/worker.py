@@ -32,6 +32,10 @@ from automation.score_plan_parser import parse_score_plan
 from automation.task_audit import TaskAudit
 
 
+class JobPreempted(RuntimeError):
+    pass
+
+
 def load_config(path: str) -> Dict[str, Any]:
     if yaml is None:
         raise RuntimeError("PyYAML is required for automation_config.yaml")
@@ -289,6 +293,10 @@ class Worker:
         job = self.get_job(job_id)
         return bool(job and job.get("status") in {"cancelled", "cancel_requested"})
 
+    def job_cancel_reason(self, job_id: int) -> str:
+        job = self.get_job(job_id)
+        return str((job or {}).get("error") or "")
+
     def fetch_score_prompt(self) -> str:
         data = api_json("GET", f"{self.central_api}/score-prompt", self.token)
         prompt = str(data.get("prompt") or "").strip()
@@ -335,6 +343,11 @@ class Worker:
                 )
         except Exception as exc:
             self.log_job(job["id"], "error", f"任务执行失败：{exc}")
+            if isinstance(exc, JobPreempted):
+                self.audit.finish_job(job, "preempted", error=str(exc))
+                if not self.report_job_status("preempt", job["id"], error=str(exc)):
+                    self.queue_pending_report("preempt", job["id"], error=str(exc))
+                return
             self.audit.finish_job(job, "failed", error=str(exc))
             if not self.report_job_status("fail", job["id"], error=str(exc)):
                 self.queue_pending_report("fail", job["id"], error=str(exc))
@@ -425,7 +438,7 @@ class Worker:
             result = self.grok.ask_with_debug_port(debug_port, prompt)
             if not result.ok:
                 raise RuntimeError(result.error)
-            parsed = parse_score_plan(result.raw_response, period=period)
+            parsed = parse_score_plan(result.raw_response, period=period, seed_extra=str(profile_id or account_id))
             return {
                 "status": "score_plan_collected",
                 "account_id": account_id,
@@ -442,7 +455,7 @@ class Worker:
             "profile_id": profile_id,
             "period": period,
             "prompt": prompt,
-            "parsed_plan": parse_score_plan("", period=period),
+            "parsed_plan": parse_score_plan("", period=period, seed_extra=str(profile_id or account_id)),
         }
 
     @staticmethod
@@ -539,6 +552,7 @@ class Worker:
         )
         timed_out_event = threading.Event()
         cancel_event = threading.Event()
+        preempt_event = threading.Event()
 
         def kill_on_timeout() -> None:
             if proc.poll() is not None:
@@ -558,6 +572,17 @@ class Worker:
         def stop_on_cancel() -> None:
             while proc.poll() is None:
                 time.sleep(5)
+                cancel_reason = self.job_cancel_reason(job_id)
+                if cancel_reason == "preempted_by_mode2":
+                    preempt_event.set()
+                    cancel_event.set()
+                    self.log_job(job_id, "preempted", "任务被模式二抢占，已重新排队，正在停止本地自动化进程")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
                 if self.is_job_cancelled(job_id):
                     cancel_event.set()
                     self.log_job(job_id, "error", "任务已被取消，正在停止本地自动化进程")
@@ -596,6 +621,10 @@ class Worker:
                 proc.wait(timeout=10)
         return_code = proc.wait()
         if cancel_event.is_set():
+            if preempt_event.is_set():
+                reason = "任务被模式二抢占，已重新排队，模式二完成后继续执行"
+                self.log_job(job_id, "preempted", reason)
+                raise JobPreempted(reason)
             reason = "任务已被计划删除/手动取消，已停止"
             self.log_job(job_id, "error", reason)
             raise RuntimeError(reason)
@@ -749,6 +778,13 @@ class Worker:
         try:
             if action == "complete":
                 self.complete(job_id, result or {})
+            elif action == "preempt":
+                api_json(
+                    "POST",
+                    f"{self.central_api}/jobs/{job_id}/preempt",
+                    self.token,
+                    {"node_id": self.node_id, "message": error or "preempted_by_mode2"},
+                )
             elif action == "fail":
                 self.fail(job_id, error)
             else:
@@ -793,7 +829,7 @@ class Worker:
         for index, record in enumerate(records):
             action = str(record.get("action") or "")
             job_id = int(record.get("job_id") or 0)
-            if not job_id or action not in {"complete", "fail"}:
+            if not job_id or action not in {"complete", "fail", "preempt"}:
                 continue
             ok = self.report_job_status(
                 action,

@@ -64,6 +64,30 @@ def save_config(config: Dict[str, Any]) -> None:
         yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
 
 
+def default_label_for_node(node_id: str) -> str:
+    text = (node_id or "").strip() or "PC-01"
+    suffix = text.rsplit("-", 1)[-1] if "-" in text else ""
+    if text.upper().startswith("PC-") and suffix.isdigit():
+        return f"Office PC {int(suffix):02d}"
+    return text
+
+
+def is_auto_label(label: str, old_node_id: str) -> bool:
+    label = (label or "").strip()
+    old_node_id = (old_node_id or "").strip()
+    if not label:
+        return True
+    defaults = {
+        old_node_id,
+        default_label_for_node(old_node_id),
+        "local-node",
+        "PC-01",
+        "Office PC 01",
+        "Office PC 1",
+    }
+    return label in defaults
+
+
 def exe_path(name: str, module: str) -> list[str]:
     base = Path(sys.executable).resolve().parent
     client_root = base.parent.parent if base.parent.name == "runtime" else base
@@ -119,11 +143,16 @@ class Launcher(tk.Tk):
 
     def collect_config(self) -> Dict[str, Any]:
         config = dict(self.config_data)
+        old_node_id = str(self.config_data.get("node_id") or "PC-01")
+        old_label = str(self.config_data.get("label") or "")
         config["card_number"] = self.vars["card_number"].get().strip()
         config["central_api"] = self.vars["central_api"].get().strip().rstrip("/")
         config["central_token"] = self.vars["central_token"].get().strip()
         config["node_id"] = self.vars["node_id"].get().strip() or "PC-01"
-        config["label"] = config.get("label") or config["node_id"]
+        if config["node_id"] != old_node_id and is_auto_label(old_label, old_node_id):
+            config["label"] = default_label_for_node(config["node_id"])
+        else:
+            config["label"] = old_label or default_label_for_node(config["node_id"])
         groups = [item.strip() for item in self.vars["sync_group_ids"].get().split(",") if item.strip()]
         config["sync_group_ids"] = groups
         config["require_license"] = True

@@ -371,6 +371,7 @@ def cn_status(status: Optional[str]) -> str:
         "running": "执行中",
         "completed": "已完成",
         "failed": "失败",
+        "preempted": "已被模式二抢占",
         "scheduled": "已调度",
         "dispatched": "已派发",
         "draft": "草稿",
@@ -604,7 +605,12 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
         job_ids = [int(x) for x in data.get("job_ids", [])]
         if not job_ids:
             return "没有创建模式任务。请用 !groups / !accounts 测试 确认分组内有账号和在线电脑。", []
-        return f"已创建模式{mode}任务 {len(job_ids)} 个。\n任务ID: {', '.join(str(x) for x in job_ids)}\n我只汇报开始、日志路径和最终结果。", job_ids
+        extra = ""
+        if mode == 2:
+            preempted = int(data.get("preempted") or 0)
+            if preempted:
+                extra = f"\n已抢占当前任务 {preempted} 个，抢占任务已重新排队。"
+        return f"已创建模式{mode}任务 {len(job_ids)} 个。\n任务ID: {', '.join(str(x) for x in job_ids)}{extra}\n我只汇报开始、日志路径和最终结果。", job_ids
     if action == "jobs":
         jobs = client.jobs(command.get("status"), command.get("job_type")).get("jobs", [])
         if not jobs:
@@ -725,9 +731,11 @@ async def watch_job(channel: Any, client: CentralClient, job_id: int) -> None:
             status_name = str(item.get("status") or "")
             if should_send_job_run(job.get("job_type"), status_name, message):
                 await channel.send(f"任务 {job_id}: {message}"[:1900])
-        if status in {"completed", "failed"}:
+        if status in {"completed", "failed", "preempted"}:
             if status == "completed":
                 await channel.send(summarize_completed_job(job)[:1900])
+            elif status == "preempted":
+                await channel.send(summarize_preempted_job(job)[:1900])
             else:
                 await channel.send(summarize_failed_job(job)[:1900])
             return
@@ -736,6 +744,8 @@ async def watch_job(channel: Any, client: CentralClient, job_id: int) -> None:
 
 def should_send_job_run(job_type: Optional[str], status: str, message: str) -> bool:
     if "本地日志文件" in message or "已打开本地 GUI" in message:
+        return True
+    if status == "preempted":
         return True
     if job_type == "legacy_mode_run":
         return status in {"error", "failed"}
@@ -789,6 +799,16 @@ def summarize_failed_job(job: Dict[str, Any]) -> str:
         f"任务 {job.get('id')} 失败：{cn_job_type(job.get('job_type'))}\n"
         f"原因: {error[:500]}\n"
         f"建议: 用 !查看日志 {job.get('id')} 查看详细日志。"
+    )
+
+
+def summarize_preempted_job(job: Dict[str, Any]) -> str:
+    result = job.get("result") or {}
+    reason = result.get("reason") or job.get("error") or "preempted_by_mode2"
+    return (
+        f"任务 {job.get('id')} 已被模式二抢占\n"
+        f"原因: {reason}\n"
+        f"系统已把该任务重新排队，模式二完成后会继续执行。"
     )
 
 

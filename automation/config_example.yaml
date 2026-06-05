@@ -1,4 +1,5 @@
 # Copy to automation_config.yaml on each local machine.
+# 每台客户端必须使用唯一 node_id，并配置对应、易识别的 label。
 node_id: PC-01
 label: Office PC 01
 

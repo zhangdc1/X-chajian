@@ -14,11 +14,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_type TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
+    priority INTEGER NOT NULL DEFAULT 10,
     target_node_id TEXT,
     leased_by TEXT,
     lease_until INTEGER,
     result_json TEXT,
     error TEXT,
+    preempted_by_job_id INTEGER,
+    preempted_from_job_id INTEGER,
+    resume_policy TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -129,7 +133,7 @@ DEFAULT_SCORE_PROMPT = """请帮我制定一份社交媒体账号权重提升计
 只输出表格，不要任何文字说明。每天单独一个表格。
 
 三、每天表格结构
-- 第一列：时间（固定5个时间点：9:00、12:00、15:00、18:00、21:00）
+- 第一列：时间（每天随机生成5个具体时间点，范围 09:00-22:30，时间点之间至少间隔约90分钟；不同天可以不同，不要固定为 9:00、12:00、15:00、18:00、21:00）
 - 其余列：点赞量、收藏量、转帖量、评论量、关注量、发帖量、手动搜索量
 - 每个单元格必须是具体的整数，禁止出现“全天分散”、“各时段执行”、“区间合并”（如08:00-09:00）等写法
 
@@ -149,8 +153,8 @@ DEFAULT_SCORE_PROMPT = """请帮我制定一份社交媒体账号权重提升计
 3. 每天总关注量不超过 20，总发帖量不超过 3。
 
 五、计划周期
-- 第一天：从今天开始，时间点 9:00、12:00、15:00、18:00、21:00 执行。
-- 后面六天：格式与第一天完全相同，数值可逐日微增，但不得超出上述范围。
+- 第一天：从今天开始，随机生成 5 个 09:00-22:30 内的具体时间点执行。
+- 后面六天：格式与第一天完全相同，每天也随机生成 5 个具体时间点；数值可逐日微增，但不得超出上述范围。
 
 请直接输出 7 天的表格（第1天到第7天），不要额外解释。表格中手动搜索量必须为 1 或 2。"""
 
@@ -179,8 +183,15 @@ class Storage:
             self._ensure_column(conn, "account_plans", "score", "INTEGER")
             self._ensure_column(conn, "account_plans", "is_current", "INTEGER DEFAULT 1")
             self._ensure_column(conn, "scheduled_tasks", "last_error", "TEXT")
+            self._ensure_column(conn, "jobs", "priority", "INTEGER NOT NULL DEFAULT 10")
+            self._ensure_column(conn, "jobs", "preempted_by_job_id", "INTEGER")
+            self._ensure_column(conn, "jobs", "preempted_from_job_id", "INTEGER")
+            self._ensure_column(conn, "jobs", "resume_policy", "TEXT")
+            conn.execute("UPDATE jobs SET priority = 100 WHERE job_type = 'legacy_mode_run' AND json_extract(payload_json, '$.mode') = 2 AND priority < 100")
+            conn.execute("UPDATE jobs SET priority = 10 WHERE priority IS NULL")
             self._ensure_column(conn, "group_aliases", "status", "TEXT DEFAULT 'active'")
             conn.execute("UPDATE group_aliases SET status = 'active' WHERE status IS NULL OR status = ''")
+            self._dedupe_active_group_aliases(conn)
             self._ensure_default_score_prompt(conn)
             self.cancel_legacy_grok_score_jobs(conn)
 
@@ -196,18 +207,42 @@ class Storage:
         job_type: str,
         payload: Dict[str, Any],
         target_node_id: Optional[str] = None,
+        priority: Optional[int] = None,
+        preempted_from_job_id: Optional[int] = None,
+        resume_policy: Optional[str] = None,
     ) -> int:
         ts = now_ts()
+        priority = int(priority if priority is not None else self.default_job_priority(job_type, payload))
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO jobs (
-                    job_type, payload_json, target_node_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    job_type, payload_json, priority, target_node_id,
+                    preempted_from_job_id, resume_policy, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_type, json.dumps(payload, ensure_ascii=False), target_node_id, ts, ts),
+                (
+                    job_type,
+                    json.dumps(payload, ensure_ascii=False),
+                    priority,
+                    target_node_id,
+                    preempted_from_job_id,
+                    resume_policy,
+                    ts,
+                    ts,
+                ),
             )
             return int(cur.lastrowid)
+
+    @staticmethod
+    def default_job_priority(job_type: str, payload: Dict[str, Any]) -> int:
+        try:
+            mode = int((payload or {}).get("mode") or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        if job_type == "legacy_mode_run" and mode == 2:
+            return 100
+        return 10
 
     def cancel_legacy_grok_score_jobs(self, conn: sqlite3.Connection) -> Dict[str, int]:
         ts = now_ts()
@@ -294,15 +329,21 @@ class Storage:
                 "生成 weekly 账号评分",
                 "生成 {period} 账号评分",
                 "生成 weekly 账号评分、内容方向",
+                "固定5个时间点",
+                "9:00、12:00、15:00、18:00、21:00",
+                "09:00/12:00/15:00/18:00/21:00",
             )
-            if correct_prompt_path.exists() and (
-                "璇峰府" in value_text
-                or "鎻愮ず" in value_text
-                or any(marker in value_text for marker in legacy_default_markers)
+            if "璇峰府" in value_text or "鎻愮ず" in value_text or any(
+                marker in value_text for marker in legacy_default_markers
             ):
+                replacement = (
+                    correct_prompt_path.read_text(encoding="utf-8")
+                    if correct_prompt_path.exists()
+                    else DEFAULT_SCORE_PROMPT
+                )
                 conn.execute(
                     "UPDATE app_settings SET value_text = ?, updated_at = ? WHERE key = 'score_prompt'",
-                    (correct_prompt_path.read_text(encoding="utf-8"), now_ts()),
+                    (replacement, now_ts()),
                 )
             return
         correct_prompt_path = Path("账号评分提示词.txt")
@@ -367,6 +408,16 @@ class Storage:
         ts = now_ts()
         conn.execute(
             """
+            UPDATE group_aliases
+            SET status = 'deleted', updated_at = ?
+            WHERE group_id = ?
+              AND alias <> ?
+              AND status = 'active'
+            """,
+            (ts, group_id, alias),
+        )
+        conn.execute(
+            """
             INSERT INTO group_aliases (alias, group_id, created_at, updated_at)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(alias) DO UPDATE SET
@@ -375,6 +426,25 @@ class Storage:
                 updated_at = excluded.updated_at
             """,
             (alias, group_id, ts, ts),
+        )
+
+    def _dedupe_active_group_aliases(self, conn: sqlite3.Connection) -> None:
+        ts = now_ts()
+        conn.execute(
+            """
+            UPDATE group_aliases
+            SET status = 'deleted', updated_at = ?
+            WHERE status = 'active'
+              AND rowid <> (
+                  SELECT keep.rowid
+                  FROM group_aliases keep
+                  WHERE keep.group_id = group_aliases.group_id
+                    AND keep.status = 'active'
+                  ORDER BY keep.updated_at DESC, keep.created_at DESC, keep.alias DESC
+                  LIMIT 1
+              )
+            """,
+            (ts,),
         )
 
     def add_worker_sync_group(self, node_id: str, group_id: str) -> Dict[str, int]:
@@ -455,11 +525,19 @@ class Storage:
                 alias_groups AS (
                     SELECT
                         group_id,
-                        GROUP_CONCAT(alias, ', ') AS alias,
+                        MAX(alias) AS alias,
                         MAX(updated_at) AS updated_at
                     FROM group_aliases
                     WHERE COALESCE(group_id, '') <> ''
                       AND status = 'active'
+                    GROUP BY group_id
+                ),
+                alias_history AS (
+                    SELECT
+                        group_id,
+                        SUM(CASE WHEN status <> 'active' THEN 1 ELSE 0 END) AS alias_history_count
+                    FROM group_aliases
+                    WHERE COALESCE(group_id, '') <> ''
                     GROUP BY group_id
                 ),
                 sync_groups AS (
@@ -479,9 +557,11 @@ class Storage:
                     COALESCE(ag.node_ids, '') AS node_ids,
                     COALESCE(ag.last_seen, 0) AS last_seen,
                     COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    COALESCE(ah.alias_history_count, 0) AS alias_history_count,
                     MAX(COALESCE(ag.updated_at, 0), COALESCE(alg.updated_at, 0), COALESCE(sg.sync_updated_at, 0)) AS updated_at
                 FROM account_groups ag
                 LEFT JOIN alias_groups alg ON alg.group_id = ag.group_id
+                LEFT JOIN alias_history ah ON ah.group_id = ag.group_id
                 LEFT JOIN sync_groups sg ON sg.group_id = ag.group_id
                 UNION ALL
                 SELECT
@@ -492,9 +572,11 @@ class Storage:
                     '' AS node_ids,
                     0 AS last_seen,
                     COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    COALESCE(ah.alias_history_count, 0) AS alias_history_count,
                     MAX(COALESCE(alg.updated_at, 0), COALESCE(sg.sync_updated_at, 0)) AS updated_at
                 FROM alias_groups alg
                 LEFT JOIN account_groups ag ON ag.group_id = alg.group_id
+                LEFT JOIN alias_history ah ON ah.group_id = alg.group_id
                 LEFT JOIN sync_groups sg ON sg.group_id = alg.group_id
                 WHERE ag.group_id IS NULL
                 UNION ALL
@@ -506,10 +588,12 @@ class Storage:
                     '' AS node_ids,
                     0 AS last_seen,
                     COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    COALESCE(ah.alias_history_count, 0) AS alias_history_count,
                     sg.sync_updated_at AS updated_at
                 FROM sync_groups sg
                 LEFT JOIN account_groups ag ON ag.group_id = sg.group_id
                 LEFT JOIN alias_groups alg ON alg.group_id = sg.group_id
+                LEFT JOIN alias_history ah ON ah.group_id = sg.group_id
                 WHERE ag.group_id IS NULL AND alg.group_id IS NULL
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -528,7 +612,7 @@ class Storage:
                 SELECT * FROM jobs
                 WHERE status = 'queued'
                   AND (target_node_id IS NULL OR target_node_id = ?)
-                ORDER BY id ASC
+                ORDER BY priority DESC, id ASC
                 LIMIT 1
                 """,
                 (node_id,),
@@ -569,8 +653,23 @@ class Storage:
                 f"忽略迟到失败上报，任务已完成：{error}",
             )
             return
+        if current and current.get("status") in {"preempted", "cancel_requested"} and current.get("error") == "preempted_by_mode2":
+            self.preempt_job(job_id, node_id, "任务被模式二抢占，已重新排队")
+            self.add_job_run(
+                job_id,
+                node_id,
+                "ignored_preempted_fail",
+                f"忽略抢占后的失败上报：{error}",
+            )
+            return
         self._finish_job(job_id, node_id, "failed", None, error)
         self._maybe_update_scheduled_task(job_id, "failed", error)
+
+    def preempt_job(self, job_id: int, node_id: str, message: str = "preempted_by_mode2") -> None:
+        current = self.get_job(job_id)
+        if current and current.get("status") in {"completed", "failed", "cancelled", "preempted"}:
+            return
+        self._finish_job(job_id, node_id, "preempted", {"status": "preempted", "reason": message}, message)
 
     def cancel_job(self, job_id: int, reason: str = "cancelled_by_user") -> Dict[str, int]:
         ts = now_ts()
@@ -1291,6 +1390,117 @@ class Storage:
             job_ids.append(job_id)
         return job_ids
 
+    def create_mode2_preemptions(self, mode2_job_ids: list[int]) -> Dict[str, Any]:
+        if not mode2_job_ids:
+            return {"preempted": 0, "requeued_job_ids": [], "preempted_job_ids": []}
+        ts = now_ts()
+        requeued_job_ids: list[int] = []
+        preempted_job_ids: list[int] = []
+        with self.connect() as conn:
+            mode2_rows = conn.execute(
+                f"""
+                SELECT id, target_node_id, payload_json
+                FROM jobs
+                WHERE id IN ({",".join("?" for _ in mode2_job_ids)})
+                  AND job_type = 'legacy_mode_run'
+                  AND json_extract(payload_json, '$.mode') = 2
+                ORDER BY id ASC
+                """,
+                mode2_job_ids,
+            ).fetchall()
+            for mode2_row in mode2_rows:
+                node_id = str(mode2_row["target_node_id"] or "")
+                if not node_id:
+                    continue
+                running_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM jobs
+                    WHERE job_type = 'legacy_mode_run'
+                      AND status = 'leased'
+                      AND COALESCE(leased_by, target_node_id, '') = ?
+                      AND id <> ?
+                      AND COALESCE(priority, 10) < 100
+                      AND COALESCE(error, '') <> 'preempted_by_mode2'
+                    ORDER BY priority ASC, id ASC
+                    """,
+                    (node_id, int(mode2_row["id"])),
+                ).fetchall()
+                for row in running_rows:
+                    original_job_id = int(row["id"])
+                    original_payload = json.loads(row["payload_json"] or "{}")
+                    original_payload.pop("_job_id", None)
+                    original_payload.pop("_local_log_path", None)
+                    cur = conn.execute(
+                        """
+                        INSERT INTO jobs (
+                            job_type, payload_json, status, priority, target_node_id,
+                            preempted_from_job_id, resume_policy, created_at, updated_at
+                        ) VALUES (?, ?, 'queued', ?, ?, ?, 'requeue_after_mode2', ?, ?)
+                        """,
+                        (
+                            row["job_type"],
+                            json.dumps(original_payload, ensure_ascii=False),
+                            int(row["priority"] or 10),
+                            row["target_node_id"],
+                            original_job_id,
+                            ts,
+                            ts,
+                        ),
+                    )
+                    new_job_id = int(cur.lastrowid)
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'cancel_requested',
+                            error = 'preempted_by_mode2',
+                            preempted_by_job_id = ?,
+                            resume_policy = 'requeue_after_mode2',
+                            updated_at = ?
+                        WHERE id = ? AND status = 'leased'
+                        """,
+                        (int(mode2_row["id"]), ts, original_job_id),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO job_runs (job_id, node_id, status, message, created_at)
+                        VALUES (?, ?, 'preempted', ?, ?)
+                        """,
+                        (
+                            original_job_id,
+                            node_id,
+                            f"任务被模式二抢占，已重新排队为 job={new_job_id}，模式二完成后继续执行。",
+                            ts,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO job_runs (job_id, node_id, status, message, created_at)
+                        VALUES (?, ?, 'queued', ?, ?)
+                        """,
+                        (
+                            new_job_id,
+                            node_id,
+                            f"由被模式二抢占的 job={original_job_id} 自动重排。",
+                            ts,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE scheduled_tasks
+                        SET job_id = ?, status = 'dispatched', updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (new_job_id, ts, original_job_id),
+                    )
+                    preempted_job_ids.append(original_job_id)
+                    requeued_job_ids.append(new_job_id)
+        return {
+            "preempted": len(preempted_job_ids),
+            "preempted_job_ids": preempted_job_ids,
+            "requeued_job_ids": requeued_job_ids,
+        }
+
     def list_plans(
         self,
         account_id: Optional[str] = None,
@@ -1544,13 +1754,14 @@ class Storage:
                 cur = conn.execute(
                     """
                     INSERT INTO jobs (
-                        job_type, payload_json, status, target_node_id,
+                        job_type, payload_json, status, priority, target_node_id,
                         created_at, updated_at
-                    ) VALUES (?, ?, 'queued', ?, ?, ?)
+                    ) VALUES (?, ?, 'queued', ?, ?, ?, ?)
                     """,
                     (
                         row["job_type"],
                         json.dumps(payload, ensure_ascii=False),
+                        self.default_job_priority(row["job_type"], payload),
                         row["node_id"],
                         ts,
                         ts,

@@ -196,9 +196,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 payload=payload.get("payload", {}),
                 target_node_id=payload.get("target_node_id"),
             )
-            write_json(self, 201, {"ok": True, "job_id": job_id})
+            job_payload = payload.get("payload", {}) or {}
+            preempted = {}
+            if job_type == "legacy_mode_run" and int(job_payload.get("mode") or 0) == 2:
+                preempted = self.storage.create_mode2_preemptions([job_id])
+            write_json(self, 201, {"ok": True, "job_id": job_id, **preempted})
             return
-        if route[0] == "jobs" and route[1].isdigit() and route[2] in {"complete", "fail"}:
+        if route[0] == "jobs" and route[1].isdigit() and route[2] in {"complete", "fail", "preempt"}:
             job_id = int(route[1])
             node_id = payload.get("node_id", "")
             if not node_id:
@@ -206,6 +210,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
             if route[2] == "complete":
                 self.storage.complete_job(job_id, node_id, payload.get("result", {}))
+            elif route[2] == "preempt":
+                self.storage.preempt_job(job_id, node_id, payload.get("message", "preempted_by_mode2"))
             else:
                 self.storage.fail_job(job_id, node_id, payload.get("error", "unknown error"))
             write_json(self, 200, {"ok": True})
@@ -376,7 +382,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 target_node_id=payload.get("target_node_id"),
                 limit=int(payload.get("limit", 500)),
             )
-            write_json(self, 201, {"ok": True, "job_ids": job_ids, "count": len(job_ids)})
+            preempted = self.storage.create_mode2_preemptions(job_ids) if mode == 2 else {}
+            write_json(self, 201, {"ok": True, "job_ids": job_ids, "count": len(job_ids), **preempted})
             return
         if parsed.path.startswith("/plans/") and parsed.path.endswith("/approve"):
             try:

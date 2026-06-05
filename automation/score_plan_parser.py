@@ -12,7 +12,10 @@ from automation.job_types import JOB_LEGACY_MODE_RUN
 from automation.model_client import OpenAICompatibleClient
 
 
-SLOT_TIMES = ["09:00", "12:00", "15:00", "18:00", "21:00"]
+RANDOM_SLOT_COUNT = 5
+RANDOM_START_MINUTE = 9 * 60
+RANDOM_END_MINUTE = 22 * 60 + 30
+RANDOM_MIN_GAP_MINUTES = 90
 METRIC_KEYS = {
     "likes": "点赞量",
     "bookmarks": "收藏量",
@@ -24,7 +27,7 @@ METRIC_KEYS = {
 }
 
 
-def parse_score_plan(raw: str, period: str = "weekly") -> Dict[str, Any]:
+def parse_score_plan(raw: str, period: str = "weekly", seed_extra: str = "") -> Dict[str, Any]:
     raw = raw or ""
     parsed = parse_markdown_tables(raw)
     if not parsed:
@@ -34,17 +37,17 @@ def parse_score_plan(raw: str, period: str = "weekly") -> Dict[str, Any]:
         parsed = parse_with_model(raw)
         parser = "model" if parsed else "rules"
     if not parsed:
-        parsed = parse_by_rules(raw, period)
+        parsed = parse_by_rules(raw, period, seed_extra=seed_extra)
         parser = "rules"
     elif not has_actionable_metrics(parsed):
-        parsed = parse_by_rules(raw, period)
+        parsed = parse_by_rules(raw, period, seed_extra=seed_extra)
         parser = "rules"
     return {
         "type": "score_plan",
         "parser": parser,
         "period": period,
         "score": extract_score(raw),
-        "days": normalize_days(parsed, period),
+        "days": normalize_days(parsed, period, seed_extra=seed_extra),
         "raw_excerpt": raw[:2000],
     }
 
@@ -126,7 +129,12 @@ def build_tasks_from_score_plan(plan: Dict[str, Any], max_days: int = 31) -> Lis
     if has_actionable_metrics(days):
         return tasks
     fallback_period = parsed.get("period") or "weekly"
-    fallback_days = normalize_days(parse_by_rules(str(plan.get("raw_excerpt") or ""), fallback_period), fallback_period)
+    fallback_seed = str(account_id or group_id or plan.get("id") or "")
+    fallback_days = normalize_days(
+        parse_by_rules(str(plan.get("raw_excerpt") or ""), fallback_period, seed_extra=fallback_seed),
+        fallback_period,
+        seed_extra=fallback_seed,
+    )
     return build_tasks_from_score_plan({**plan, "parsed_plan": {**parsed, "days": fallback_days}}, max_days=max_days)
 
 
@@ -158,9 +166,9 @@ def parse_with_model(raw: str) -> List[Dict[str, Any]]:
         return []
     prompt = (
         "把下面的账号权重提升计划转换为 JSON。只输出 JSON，格式为："
-        '{"days":[{"day_index":1,"slots":[{"time":"09:00","metrics":{"likes":1,"bookmarks":1,'
+        '{"days":[{"day_index":1,"slots":[{"time":"13:25","metrics":{"likes":1,"bookmarks":1,'
         '"retweets":1,"replies":1,"follows":1,"posts":0,"manual_searches":1},"target_urls":[]}]}]}。'
-        "缺失数值填 0，时间统一为 09:00/12:00/15:00/18:00/21:00。\n\n"
+        "保留原文里的 HH:MM 时间；缺失数值填 0；如果时间缺失或不合法，time 填空字符串。\n\n"
         + raw[:8000]
     )
     try:
@@ -229,49 +237,45 @@ def parse_plain_metric_tables(raw: str) -> List[Dict[str, Any]]:
     return days
 
 
-def parse_by_rules(raw: str, period: str) -> List[Dict[str, Any]]:
+def parse_by_rules(raw: str, period: str, seed_extra: str = "") -> List[Dict[str, Any]]:
     days_count = 1 if period == "daily" else 7
-    rng = random.Random(int(hashlib.sha256(f"{period}|{raw[:1000]}".encode("utf-8")).hexdigest()[:16], 16))
+    rng = random.Random(seed_int(period, raw[:1000], seed_extra))
     days = []
     metric_ranges = {
-        "likes": (12, 18),
-        "bookmarks": (1, 4),
-        "retweets": (0, 3),
-        "replies": (1, 3),
-        "follows": (0, 2),
-        "manual_searches": (1, 3),
+        "likes": (15, 35),
+        "bookmarks": (3, 12),
+        "retweets": (2, 8),
+        "replies": (2, 12),
+        "follows": (2, 5),
+        "manual_searches": (1, 2),
     }
-    active_slots = {"09:00", "12:00", "15:00", "18:00", "21:00"}
     for day_index in range(1, days_count + 1):
         slots = []
+        slot_times = random_slot_times(f"{period}|{seed_extra}|day={day_index}|{raw[:300]}")
         progress = 0 if days_count <= 1 else (day_index - 1) / max(1, days_count - 1)
-        day_trend = 0.88 + progress * 0.18
-        post_slots = set()
-        if day_index % 2 == 1:
-            post_slots.add("12:00")
-        if rng.random() > 0.45 or day_index in {1, days_count}:
-            post_slots.add("18:00")
-        if rng.random() > 0.75:
-            post_slots.add("15:00")
-        for slot_time in SLOT_TIMES:
-            slot_bias = {
-                "09:00": -0.06,
-                "12:00": 0.04,
-                "15:00": 0.02,
-                "18:00": 0.05,
-                "21:00": -0.01,
-            }.get(slot_time, 0.0)
+        day_trend = 0.90 + progress * 0.16 + rng.uniform(-0.04, 0.04)
+        post_target = rng.choice([1, 1, 2, 2, 3])
+        post_indices = set(rng.sample(range(RANDOM_SLOT_COUNT), k=min(3, post_target)))
+        follows_remaining = 20
+        for index, slot_time in enumerate(slot_times):
+            slots_left = RANDOM_SLOT_COUNT - index
+            min_for_rest = 2 * (slots_left - 1)
+            follow_low, follow_high = metric_ranges["follows"]
+            follow_max = min(follow_high, follows_remaining - min_for_rest)
+            follows = rng.randint(follow_low, max(follow_low, follow_max))
+            follows_remaining -= follows
+            slot_bias = (index - 2) * 0.025
             slots.append(
                 {
                     "time": slot_time,
                     "metrics": {
-                        "likes": vary_metric(rng, metric_ranges["likes"], day_trend + slot_bias, slot_time),
-                        "bookmarks": vary_metric(rng, metric_ranges["bookmarks"], day_trend + slot_bias * 0.8, slot_time),
-                        "retweets": vary_metric(rng, metric_ranges["retweets"], day_trend + slot_bias * 0.6, slot_time),
-                        "replies": vary_metric(rng, metric_ranges["replies"], day_trend + slot_bias * 0.7, slot_time),
-                        "follows": vary_metric(rng, metric_ranges["follows"], day_trend + slot_bias * 0.5, slot_time),
-                        "posts": 1 if slot_time in post_slots else 0,
-                        "manual_searches": vary_metric(rng, metric_ranges["manual_searches"], day_trend + slot_bias * 0.3, slot_time),
+                        "likes": vary_metric(rng, metric_ranges["likes"], day_trend + slot_bias),
+                        "bookmarks": vary_metric(rng, metric_ranges["bookmarks"], day_trend + slot_bias * 0.8),
+                        "retweets": vary_metric(rng, metric_ranges["retweets"], day_trend + slot_bias * 0.6),
+                        "replies": vary_metric(rng, metric_ranges["replies"], day_trend + slot_bias * 0.7),
+                        "follows": follows,
+                        "posts": 1 if index in post_indices else 0,
+                        "manual_searches": rng.randint(*metric_ranges["manual_searches"]),
                     },
                 }
             )
@@ -279,46 +283,92 @@ def parse_by_rules(raw: str, period: str) -> List[Dict[str, Any]]:
     return days
 
 
-def vary_metric(rng: random.Random, bounds: tuple[int, int], day_factor: float, slot_time: str) -> int:
+def vary_metric(rng: random.Random, bounds: tuple[int, int], day_factor: float) -> int:
     low, high = bounds
     base = rng.randint(low, high)
-    slot_adjust = {
-        "09:00": -1,
-        "12:00": 1,
-        "15:00": 0,
-        "18:00": 1,
-        "21:00": -1,
-    }.get(slot_time, 0)
     spread = max(1, high - low)
     trend_adjust = int(round((day_factor - 1.0) * spread))
-    jitter = rng.randint(-1, 1)
-    return max(low, min(high, base + trend_adjust + slot_adjust + jitter))
+    jitter = rng.randint(-2, 2)
+    return max(low, min(high, base + trend_adjust + jitter))
 
 
-def normalize_days(days: List[Dict[str, Any]], period: str) -> List[Dict[str, Any]]:
+def normalize_days(days: List[Dict[str, Any]], period: str, seed_extra: str = "") -> List[Dict[str, Any]]:
     count = 1 if period == "daily" else 30 if period == "monthly" else 7
     result = []
     today = date.today()
     for idx in range(count):
         source = days[idx] if idx < len(days) else {"slots": []}
-        slots = normalize_slots(source.get("slots") or [])
+        slots = normalize_slots(source.get("slots") or [], seed_extra=f"{seed_extra}|day={idx + 1}")
         result.append({"day_index": idx + 1, "date": (today + timedelta(days=idx)).isoformat(), "slots": slots})
     return result
 
 
-def normalize_slots(slots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_time = {normalize_time(slot.get("time")): slot for slot in slots if slot.get("time")}
+def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "") -> List[Dict[str, Any]]:
     normalized = []
-    for slot_time in SLOT_TIMES:
-        source = by_time.get(slot_time) or {}
+    seen = set()
+    for slot in slots:
+        slot_time = normalize_time(slot.get("time"))
+        if not slot_time or slot_time in seen:
+            continue
+        seen.add(slot_time)
         normalized.append(
             {
                 "time": slot_time,
-                "metrics": normalize_metrics(source.get("metrics") or source),
-                "target_urls": extract_urls(json.dumps(source, ensure_ascii=False)),
+                "metrics": normalize_metrics(slot.get("metrics") or slot),
+                "target_urls": extract_urls(json.dumps(slot, ensure_ascii=False)),
             }
         )
+    normalized.sort(key=lambda item: item["time"])
+    if len(normalized) >= RANDOM_SLOT_COUNT:
+        return normalized[:RANDOM_SLOT_COUNT]
+    for slot_time in random_slot_times(f"normalize|{seed_extra}"):
+        if slot_time in seen:
+            continue
+        seen.add(slot_time)
+        normalized.append(
+            {
+                "time": slot_time,
+                "metrics": {key: 0 for key in METRIC_KEYS},
+                "target_urls": [],
+            }
+        )
+        if len(normalized) >= RANDOM_SLOT_COUNT:
+            break
+    normalized.sort(key=lambda item: item["time"])
     return normalized
+
+
+def seed_int(*parts: Any) -> int:
+    text = "|".join(str(part) for part in parts)
+    return int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:16], 16)
+
+
+def random_slot_times(seed_material: str) -> List[str]:
+    rng = random.Random(seed_int(seed_material))
+    candidates = list(range(RANDOM_START_MINUTE, RANDOM_END_MINUTE + 1, 5))
+    for _ in range(1000):
+        picks = sorted(rng.sample(candidates, RANDOM_SLOT_COUNT))
+        if all((b - a) >= RANDOM_MIN_GAP_MINUTES for a, b in zip(picks, picks[1:])):
+            return [minute_to_hhmm(item) for item in picks]
+    span = RANDOM_END_MINUTE - RANDOM_START_MINUTE
+    picks = []
+    for index in range(RANDOM_SLOT_COUNT):
+        base = RANDOM_START_MINUTE + round(index * span / max(1, RANDOM_SLOT_COUNT - 1))
+        jitter = rng.randint(-20, 20)
+        minute = min(RANDOM_END_MINUTE, max(RANDOM_START_MINUTE, base + jitter))
+        minute = int(round(minute / 5) * 5)
+        picks.append(minute)
+    picks = sorted(dict.fromkeys(picks))
+    while len(picks) < RANDOM_SLOT_COUNT:
+        for candidate in candidates:
+            if candidate not in picks and all(abs(candidate - existing) >= 60 for existing in picks):
+                picks.append(candidate)
+                break
+    return [minute_to_hhmm(item) for item in sorted(picks[:RANDOM_SLOT_COUNT])]
+
+
+def minute_to_hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
 def normalize_metrics(metrics: Dict[str, Any]) -> Dict[str, int]:
@@ -378,7 +428,7 @@ def ensure_day(days: List[Dict[str, Any]], day_index: int) -> Dict[str, Any]:
 def normalize_time(value: Any) -> str:
     match = re.search(r"([01]?\d|2[0-3])[:：]([0-5]\d)", str(value or ""))
     if not match:
-        return "09:00"
+        return ""
     return f"{int(match.group(1)):02d}:{match.group(2)}"
 
 
