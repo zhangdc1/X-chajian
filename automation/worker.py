@@ -32,6 +32,26 @@ from automation.score_plan_parser import parse_score_plan
 from automation.task_audit import TaskAudit
 
 
+DEFAULT_CENTRAL_API = "https://mjam.top"
+DEFAULT_CENTRAL_TOKEN = "b25e3fa1bbcedd6cc3edd495a9fda1538ab4db11a979bf1b87406c44d63f6978"
+DEFAULT_MODEL_CONFIG = {
+    "enabled": True,
+    "provider": "openai_compatible",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-8dc4ccade0764eab89c44692a68ac06b",
+    "model": "deepseek-v4-flash",
+}
+DEFAULT_WORKER_CONFIG = {
+    "central_api": DEFAULT_CENTRAL_API,
+    "central_token": DEFAULT_CENTRAL_TOKEN,
+    "enable_grok_browser": True,
+    "open_gui_for_legacy": False,
+    "sync_profiles_interval_seconds": 30,
+    "worker_config_interval_seconds": 30,
+    "stale_job_grace_seconds": 3600,
+}
+
+
 class JobPreempted(RuntimeError):
     pass
 
@@ -40,7 +60,10 @@ def load_config(path: str) -> Dict[str, Any]:
     if yaml is None:
         raise RuntimeError("PyYAML is required for automation_config.yaml")
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        loaded = yaml.safe_load(f) or {}
+    config = dict(DEFAULT_WORKER_CONFIG)
+    config.update(loaded)
+    return config
 
 
 def save_config(path: str, config: Dict[str, Any]) -> None:
@@ -115,6 +138,7 @@ class Worker:
         self._last_forwarded_legacy_log = ""
         self._last_forwarded_legacy_ts = 0.0
         self._current_log_path: Optional[Path] = None
+        self.current_job: Dict[str, Any] = {}
         self.audit = TaskAudit(
             config.get("task_dir", "automation/tasks"),
             config.get("log_dir", "automation/logs"),
@@ -127,6 +151,7 @@ class Worker:
             exist_ok=True,
         )
         self.pending_reports_path = Path(config.get("task_dir", "automation/tasks")) / "pending_job_reports.jsonl"
+        self.apply_central_config(save_local=False)
 
     @staticmethod
     def app_root() -> Path:
@@ -162,9 +187,14 @@ class Worker:
         last_heartbeat = 0.0
         last_license_heartbeat = time.time()
         last_profile_sync = 0.0
+        last_config_refresh = 0.0
         while True:
             now = time.time()
             self.flush_pending_reports()
+            config_interval = int(self.config.get("worker_config_interval_seconds", 30) or 30)
+            if now - last_config_refresh >= config_interval:
+                self.apply_central_config(save_local=True)
+                last_config_refresh = now
             if now - last_heartbeat >= 30:
                 self.heartbeat()
                 last_heartbeat = now
@@ -203,12 +233,80 @@ class Worker:
                 "respect_manual_open_profiles": self.config.get("respect_manual_open_profiles", True),
                 "enable_grok_browser": self.config.get("enable_grok_browser", False),
                 "sync_group_ids": self.config.get("sync_group_ids") or [],
+                "client_version": self.config.get("app_version", "unknown"),
+                "config_version": self.config.get("config_version"),
+                "current_job": self.current_job,
             },
         }
         try:
             api_json("POST", f"{self.central_api}/worker/heartbeat", self.token, payload)
         except Exception as exc:
             print(f"heartbeat failed: {exc}")
+
+    def apply_central_config(self, save_local: bool = True) -> None:
+        try:
+            response = api_json("GET", f"{self.central_api}/worker/config?node_id={self.node_id}", self.token)
+            central_config = response.get("config") or {}
+        except Exception as exc:
+            print(f"worker config refresh failed: {exc}")
+            return
+        changed = False
+        for key in (
+            "label",
+            "enable_grok_browser",
+            "open_gui_for_legacy",
+            "sync_profiles_interval_seconds",
+            "worker_config_interval_seconds",
+            "stale_job_grace_seconds",
+            "config_version",
+        ):
+            if key in central_config and self.config.get(key) != central_config.get(key):
+                self.config[key] = central_config.get(key)
+                changed = True
+        if central_config.get("central_api") and self.config.get("central_api") != central_config.get("central_api"):
+            self.config["central_api"] = str(central_config.get("central_api")).rstrip("/")
+            self.central_api = self.config["central_api"]
+            changed = True
+        if central_config.get("central_token") and self.config.get("central_token") != central_config.get("central_token"):
+            self.config["central_token"] = central_config.get("central_token")
+            self.token = self.config["central_token"]
+            changed = True
+        assigned_groups = [str(item).strip() for item in (central_config.get("sync_group_ids") or []) if str(item).strip()]
+        if "sync_group_ids" in central_config and assigned_groups != [str(item).strip() for item in (self.config.get("sync_group_ids") or [])]:
+            self.config["sync_group_ids"] = assigned_groups
+            changed = True
+        if self.label != str(self.config.get("label") or self.node_id):
+            self.label = str(self.config.get("label") or self.node_id)
+        model_config = central_config.get("model_config")
+        if isinstance(model_config, dict):
+            self.write_model_config(model_config)
+        if changed and save_local:
+            try:
+                save_config(self.config_path, self.config)
+                print("updated local automation_config.yaml from central")
+            except Exception as exc:
+                print(f"save central worker config failed: {exc}")
+
+    def write_model_config(self, model_config: Dict[str, Any]) -> None:
+        if yaml is None:
+            return
+        path = self.app_root() / "model_config.yaml"
+        current: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                current = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                current = {}
+        merged = dict(current)
+        merged.update(model_config)
+        if merged == current:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
+            print("updated model_config.yaml from central")
+        except Exception as exc:
+            print(f"save model_config.yaml failed: {exc}")
 
     def check_license_heartbeat(self) -> None:
         max_failures = int(self.config.get("license_max_failures", 3) or 3)
@@ -306,6 +404,13 @@ class Worker:
 
     def handle_job(self, job: Dict[str, Any]) -> None:
         payload = job.setdefault("payload", {})
+        self.current_job = {
+            "id": job.get("id"),
+            "job_type": job.get("job_type"),
+            "mode": payload.get("mode"),
+            "account_id": payload.get("account_id") or payload.get("profile_id"),
+            "started_at": int(time.time()),
+        }
         if job.get("status") in {"cancelled", "cancel_requested"} or self.is_job_cancelled(int(job["id"])):
             self.fail(job["id"], "任务已取消，未执行")
             return
@@ -354,6 +459,7 @@ class Worker:
         finally:
             self.lock.release(lock_path)
             self._current_log_path = None
+            self.current_job = {}
 
     def execute(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = job["job_type"]

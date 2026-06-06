@@ -30,8 +30,8 @@ def load_config() -> Dict[str, Any]:
             CONFIG_PATH.write_text(
                 "node_id: PC-01\n"
                 "label: Office PC 01\n"
-                "central_api: https://your-domain.example\n"
-                "central_token: change-me\n"
+                "central_api: https://mjam.top\n"
+                "central_token: b25e3fa1bbcedd6cc3edd495a9fda1538ab4db11a979bf1b87406c44d63f6978\n"
                 "worker_enabled: true\n"
                 "card_number: ''\n"
                 "app_version: '1.0.0'\n"
@@ -39,7 +39,9 @@ def load_config() -> Dict[str, Any]:
                 "license_heartbeat_seconds: 60\n"
                 "license_max_failures: 3\n"
                 "bit_api_url: http://127.0.0.1:54345\n"
-                "sync_group_ids: []\n",
+                "sync_group_ids: []\n"
+                "enable_grok_browser: true\n"
+                "open_gui_for_legacy: false\n",
                 encoding="utf-8",
             )
     try:
@@ -110,8 +112,8 @@ class Launcher(tk.Tk):
         self.start_button: ttk.Button | None = None
         self.vars = {
             "card_number": tk.StringVar(value=str(self.config_data.get("card_number") or "")),
-            "central_api": tk.StringVar(value=str(self.config_data.get("central_api") or "")),
-            "central_token": tk.StringVar(value=str(self.config_data.get("central_token") or "")),
+            "central_api": tk.StringVar(value=str(self.config_data.get("central_api") or "https://mjam.top")),
+            "central_token": tk.StringVar(value=str(self.config_data.get("central_token") or "b25e3fa1bbcedd6cc3edd495a9fda1538ab4db11a979bf1b87406c44d63f6978")),
             "node_id": tk.StringVar(value=str(self.config_data.get("node_id") or "PC-01")),
             "sync_group_ids": tk.StringVar(value=",".join(self.config_data.get("sync_group_ids") or [])),
         }
@@ -165,6 +167,8 @@ class Launcher(tk.Tk):
         config.setdefault("license_max_failures", 3)
         config.setdefault("worker_autorestart", True)
         config.setdefault("worker_restart_interval_seconds", 10)
+        config.setdefault("enable_grok_browser", True)
+        config.setdefault("open_gui_for_legacy", False)
         return config
 
     def save_validate_start(self) -> None:

@@ -3,8 +3,8 @@
 node_id: PC-01
 label: Office PC 01
 
-central_api: http://127.0.0.1:8766
-central_token: change-me
+central_api: https://mjam.top
+central_token: b25e3fa1bbcedd6cc3edd495a9fda1538ab4db11a979bf1b87406c44d63f6978
 
 worker_enabled: true
 poll_interval_seconds: 5
@@ -15,7 +15,8 @@ max_concurrency: 1
 bit_api_url: http://127.0.0.1:54345
 sync_group_ids: []
 sync_profiles_on_start: true
-sync_profiles_interval_seconds: 60
+sync_profiles_interval_seconds: 30
+worker_config_interval_seconds: 30
 
 # Existing card-key system. Leave empty during local skeleton testing, then
 # fill before production packaging.
@@ -33,7 +34,8 @@ lock_dir: automation/local_locks
 log_dir: automation/logs
 draft_output_path: automation/output/comment_drafts.jsonl
 
-enable_grok_browser: false
+enable_grok_browser: true
+open_gui_for_legacy: false
 grok:
   grok_url: https://x.com/i/grok
   initial_wait_seconds: 5

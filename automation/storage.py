@@ -8,6 +8,16 @@ from automation.plan_parser import build_tasks_from_plan
 from automation.score_plan_parser import build_tasks_from_score_plan
 
 
+DEFAULT_CENTRAL_API = "https://mjam.top"
+DEFAULT_CENTRAL_TOKEN = "b25e3fa1bbcedd6cc3edd495a9fda1538ab4db11a979bf1b87406c44d63f6978"
+DEFAULT_MODEL_CONFIG = {
+    "enabled": True,
+    "provider": "openai_compatible",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-8dc4ccade0764eab89c44692a68ac06b",
+    "model": "deepseek-v4-flash",
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -381,6 +391,155 @@ class Storage:
             item["detail"] = json.loads(item.pop("detail_json") or "{}")
             result.append(item)
         return result
+
+    @staticmethod
+    def _mask_secret(value: str, keep: int = 6) -> str:
+        text = str(value or "")
+        if not text:
+            return ""
+        if len(text) <= keep * 2:
+            return text[:2] + "***"
+        return f"{text[:keep]}...{text[-keep:]}"
+
+    @staticmethod
+    def default_worker_config() -> Dict[str, Any]:
+        return {
+            "central_api": DEFAULT_CENTRAL_API,
+            "central_token": DEFAULT_CENTRAL_TOKEN,
+            "enable_grok_browser": True,
+            "open_gui_for_legacy": False,
+            "sync_profiles_interval_seconds": 30,
+            "worker_config_interval_seconds": 30,
+            "stale_job_grace_seconds": 3600,
+            "model_config": dict(DEFAULT_MODEL_CONFIG),
+        }
+
+    def _get_json_setting(self, conn: sqlite3.Connection, key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        row = conn.execute("SELECT value_text FROM app_settings WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return dict(default or {})
+        try:
+            data = json.loads(str(row["value_text"] or "{}"))
+            return data if isinstance(data, dict) else dict(default or {})
+        except json.JSONDecodeError:
+            return dict(default or {})
+
+    def _set_json_setting(self, conn: sqlite3.Connection, key: str, value: Dict[str, Any]) -> None:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value_text, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_text = excluded.value_text,
+                updated_at = excluded.updated_at
+            """,
+            (key, json.dumps(value, ensure_ascii=False), now_ts()),
+        )
+
+    def get_worker_config(self, node_id: str, mask_secrets: bool = False) -> Dict[str, Any]:
+        node_id = str(node_id or "").strip()
+        with self.connect() as conn:
+            global_cfg = self._get_json_setting(conn, "worker_default_config", self.default_worker_config())
+            node_cfg = self._get_json_setting(conn, f"worker_config:{node_id}", {})
+            worker_row = conn.execute("SELECT label, meta_json FROM worker_nodes WHERE node_id = ?", (node_id,)).fetchone()
+            sync_rows = conn.execute(
+                """
+                SELECT group_id FROM worker_sync_groups
+                WHERE node_id = ? AND status = 'active'
+                ORDER BY updated_at DESC, group_id
+                """,
+                (node_id,),
+            ).fetchall()
+        cfg = self.default_worker_config()
+        cfg.update(global_cfg)
+        cfg.update(node_cfg)
+        cfg["node_id"] = node_id
+        cfg["label_managed"] = "label" in node_cfg
+        if worker_row and not cfg.get("label"):
+            cfg["label"] = worker_row["label"] or node_id
+        cfg.setdefault("label", node_id)
+        cfg["sync_group_ids"] = [str(row["group_id"]) for row in sync_rows]
+        cfg["config_version"] = int(
+            max(
+                int(cfg.get("config_version") or 0),
+                int(node_cfg.get("updated_at") or 0),
+            )
+        ) or now_ts()
+        if mask_secrets:
+            cfg["central_token"] = self._mask_secret(str(cfg.get("central_token") or ""))
+            model_cfg = dict(cfg.get("model_config") or {})
+            model_cfg["api_key"] = self._mask_secret(str(model_cfg.get("api_key") or ""))
+            cfg["model_config"] = model_cfg
+        return cfg
+
+    def update_worker_config(self, node_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            raise ValueError("missing node_id")
+        allowed = {
+            "label",
+            "enable_grok_browser",
+            "open_gui_for_legacy",
+            "sync_profiles_interval_seconds",
+            "worker_config_interval_seconds",
+            "stale_job_grace_seconds",
+            "model_config",
+        }
+        with self.connect() as conn:
+            current = self._get_json_setting(conn, f"worker_config:{node_id}", {})
+            for key, value in (updates or {}).items():
+                if key in allowed:
+                    current[key] = value
+            current["updated_at"] = now_ts()
+            self._set_json_setting(conn, f"worker_config:{node_id}", current)
+            if "label" in updates:
+                conn.execute(
+                    """
+                    INSERT INTO worker_nodes (node_id, label, last_seen, status, meta_json)
+                    VALUES (?, ?, ?, 'offline', '{}')
+                    ON CONFLICT(node_id) DO UPDATE SET label = excluded.label
+                    """,
+                    (node_id, str(updates.get("label") or node_id), now_ts()),
+                )
+        return self.get_worker_config(node_id, mask_secrets=True)
+
+    def update_worker_default_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {
+            "central_api",
+            "central_token",
+            "enable_grok_browser",
+            "open_gui_for_legacy",
+            "sync_profiles_interval_seconds",
+            "worker_config_interval_seconds",
+            "stale_job_grace_seconds",
+            "model_config",
+        }
+        with self.connect() as conn:
+            current = self._get_json_setting(conn, "worker_default_config", self.default_worker_config())
+            for key, value in (updates or {}).items():
+                if key in allowed:
+                    current[key] = value
+            current["updated_at"] = now_ts()
+            self._set_json_setting(conn, "worker_default_config", current)
+        cfg = dict(self.default_worker_config())
+        cfg.update(current)
+        cfg["central_token"] = self._mask_secret(str(cfg.get("central_token") or ""))
+        model_cfg = dict(cfg.get("model_config") or {})
+        model_cfg["api_key"] = self._mask_secret(str(model_cfg.get("api_key") or ""))
+        cfg["model_config"] = model_cfg
+        return cfg
+
+    def get_worker_default_config(self, mask_secrets: bool = True) -> Dict[str, Any]:
+        with self.connect() as conn:
+            current = self._get_json_setting(conn, "worker_default_config", self.default_worker_config())
+        cfg = dict(self.default_worker_config())
+        cfg.update(current)
+        if mask_secrets:
+            cfg["central_token"] = self._mask_secret(str(cfg.get("central_token") or ""))
+            model_cfg = dict(cfg.get("model_config") or {})
+            model_cfg["api_key"] = self._mask_secret(str(model_cfg.get("api_key") or ""))
+            cfg["model_config"] = model_cfg
+        return cfg
 
     def account_timeline(self, profile_id: str, limit: int = 100) -> list[Dict[str, Any]]:
         with self.connect() as conn:
@@ -858,18 +1017,60 @@ class Storage:
     def lease_next_job(self, node_id: str, lease_seconds: int = 300) -> Optional[Dict[str, Any]]:
         ts = now_ts()
         lease_until = ts + lease_seconds
+        cutoff = ts - 3600
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = 'queued'
-                  AND (target_node_id IS NULL OR target_node_id = ?)
-                ORDER BY priority DESC, id ASC
-                LIMIT 1
-                """,
-                (node_id,),
-            ).fetchone()
+            row = None
+            while True:
+                row = conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    WHERE status = 'queued'
+                      AND (target_node_id IS NULL OR target_node_id = ?)
+                    ORDER BY priority DESC, id ASC
+                    LIMIT 1
+                    """,
+                    (node_id,),
+                ).fetchone()
+                if row is None:
+                    break
+                payload = json.loads(row["payload_json"] or "{}")
+                mode = int(payload.get("mode") or 0) if str(payload.get("mode") or "").isdigit() else 0
+                run_at = int(payload.get("run_at") or 0)
+                is_scheduled = bool(payload.get("scheduled_task_id") or payload.get("source") == "scheduled_task")
+                stale_scheduled_legacy = row["job_type"] == "legacy_mode_run" and mode != 2 and is_scheduled and run_at and run_at < cutoff
+                stale_score_job = row["job_type"] == "score_grok_plan" and int(row["created_at"] or 0) < cutoff
+                if stale_scheduled_legacy or stale_score_job:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'cancelled',
+                            error = 'expired_missed_before_lease',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (ts, row["id"]),
+                    )
+                    if payload.get("scheduled_task_id"):
+                        conn.execute(
+                            """
+                            UPDATE scheduled_tasks
+                            SET status = 'expired_missed',
+                                last_error = 'missed scheduled time; skipped before lease',
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (ts, int(payload.get("scheduled_task_id"))),
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO job_runs (job_id, node_id, status, message, created_at)
+                        VALUES (?, ?, 'cancelled', 'expired_missed_before_lease', ?)
+                        """,
+                        (row["id"], node_id, ts),
+                    )
+                    continue
+                break
             if row is None:
                 conn.commit()
                 return None
@@ -959,6 +1160,81 @@ class Storage:
                 (new_status, reason, ts, job_id),
             )
         return {"jobs": 1}
+
+    def bulk_cancel_jobs(self, job_ids: list[int], reason: str = "cancelled_by_admin") -> Dict[str, int]:
+        changed = 0
+        for job_id in job_ids:
+            result = self.cancel_job(int(job_id), reason)
+            changed += int(result.get("jobs", 0))
+        return {"jobs": changed, "requested": len(job_ids)}
+
+    def cleanup_stale_jobs(
+        self,
+        grace_seconds: int = 3600,
+        include_score_jobs: bool = True,
+        include_legacy_scheduled: bool = True,
+    ) -> Dict[str, int]:
+        ts = now_ts()
+        cutoff = ts - int(grace_seconds)
+        with self.connect() as conn:
+            scheduled_rows = conn.execute(
+                """
+                SELECT id FROM scheduled_tasks
+                WHERE status = 'scheduled' AND run_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            scheduled_ids = [int(row["id"]) for row in scheduled_rows]
+            queued_rows = conn.execute(
+                """
+                SELECT id, payload_json, job_type, created_at FROM jobs
+                WHERE status = 'queued'
+                """
+            ).fetchall()
+            stale_job_ids: list[int] = []
+            for row in queued_rows:
+                payload = json.loads(row["payload_json"] or "{}")
+                job_type = str(row["job_type"] or "")
+                run_at = int(payload.get("run_at") or 0)
+                source = str(payload.get("source") or "")
+                mode = int(payload.get("mode") or 0) if str(payload.get("mode") or "").isdigit() else 0
+                is_scheduled_legacy = include_legacy_scheduled and job_type == "legacy_mode_run" and mode != 2 and (source or payload.get("scheduled_task_id"))
+                is_score = include_score_jobs and job_type == "score_grok_plan" and int(row["created_at"] or 0) < cutoff
+                if (is_scheduled_legacy and run_at and run_at < cutoff) or is_score:
+                    stale_job_ids.append(int(row["id"]))
+            if scheduled_ids:
+                placeholders = ",".join("?" for _ in scheduled_ids)
+                conn.execute(
+                    f"""
+                    UPDATE scheduled_tasks
+                    SET status = 'expired_missed',
+                        last_error = 'missed scheduled time; skipped by stale cleanup',
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    [ts, *scheduled_ids],
+                )
+            if stale_job_ids:
+                placeholders = ",".join("?" for _ in stale_job_ids)
+                conn.execute(
+                    f"""
+                    UPDATE jobs
+                    SET status = 'cancelled',
+                        error = 'expired_missed_or_stale_cleanup',
+                        updated_at = ?
+                    WHERE id IN ({placeholders}) AND status = 'queued'
+                    """,
+                    [ts, *stale_job_ids],
+                )
+                for job_id in stale_job_ids:
+                    conn.execute(
+                        """
+                        INSERT INTO job_runs (job_id, node_id, status, message, created_at)
+                        VALUES (?, '', 'cancelled', 'expired_missed_or_stale_cleanup', ?)
+                        """,
+                        (job_id, ts),
+                    )
+        return {"scheduled_expired": len(scheduled_ids), "jobs_cancelled": len(stale_job_ids)}
 
     def cancel_jobs_for_plan(self, plan_id: int, reason: str = "cancelled_by_plan") -> Dict[str, int]:
         ts = now_ts()
@@ -1261,6 +1537,14 @@ class Storage:
 
     def heartbeat_worker(self, node_id: str, label: str, status: str, meta: Dict[str, Any]) -> None:
         ts = now_ts()
+        central_cfg = self.get_worker_config(node_id, mask_secrets=False)
+        effective_label = str(central_cfg.get("label") if central_cfg.get("label_managed") else (label or central_cfg.get("label") or node_id))
+        meta = dict(meta or {})
+        meta["central_config"] = {
+            "enable_grok_browser": bool(central_cfg.get("enable_grok_browser")),
+            "open_gui_for_legacy": bool(central_cfg.get("open_gui_for_legacy")),
+            "config_version": central_cfg.get("config_version"),
+        }
         with self.connect() as conn:
             conn.execute(
                 """
@@ -1272,10 +1556,11 @@ class Storage:
                     status = excluded.status,
                     meta_json = excluded.meta_json
                 """,
-                (node_id, label, ts, status, json.dumps(meta, ensure_ascii=False)),
+                (node_id, effective_label, ts, status, json.dumps(meta, ensure_ascii=False)),
             )
 
-    def list_workers(self, limit: int = 100) -> list[Dict[str, Any]]:
+    def list_workers(self, limit: int = 100, offline_after_seconds: int = 90) -> list[Dict[str, Any]]:
+        ts = now_ts()
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -1289,6 +1574,9 @@ class Storage:
         for row in rows:
             item = dict(row)
             item["meta"] = json.loads(item.pop("meta_json") or "{}")
+            item["online"] = str(item.get("status") or "") == "online" and ts - int(item.get("last_seen") or 0) <= offline_after_seconds
+            item["offline_seconds"] = max(0, ts - int(item.get("last_seen") or 0))
+            item["central_config"] = self.get_worker_config(str(item.get("node_id") or ""), mask_secrets=True)
             result.append(item)
         return result
 
@@ -1437,19 +1725,30 @@ class Storage:
         node_id: Optional[str] = None,
         limit: int = 500,
         include_inactive: bool = False,
+        offline_after_seconds: int = 90,
     ) -> list[Dict[str, Any]]:
         group_id = self.resolve_group_id(group_id)
-        sql = "SELECT * FROM accounts WHERE 1=1"
+        ts = now_ts()
+        sql = """
+            SELECT
+                accounts.*,
+                worker_nodes.last_seen AS node_last_seen,
+                worker_nodes.status AS node_status,
+                worker_nodes.label AS node_label
+            FROM accounts
+            LEFT JOIN worker_nodes ON worker_nodes.node_id = accounts.node_id
+            WHERE 1=1
+        """
         params: list[Any] = []
         if not include_inactive:
-            sql += " AND status = 'active'"
+            sql += " AND accounts.status = 'active'"
         if group_id:
-            sql += " AND group_id = ?"
+            sql += " AND accounts.group_id = ?"
             params.append(group_id)
         if node_id:
-            sql += " AND node_id = ?"
+            sql += " AND accounts.node_id = ?"
             params.append(node_id)
-        sql += " ORDER BY node_id, profile_name, profile_id LIMIT ?"
+        sql += " ORDER BY accounts.node_id, accounts.profile_name, accounts.profile_id LIMIT ?"
         params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -1457,6 +1756,10 @@ class Storage:
         for row in rows:
             item = dict(row)
             item["meta"] = json.loads(item.pop("meta_json") or "{}")
+            node_last_seen = int(item.get("node_last_seen") or 0)
+            item["node_online"] = str(item.get("node_status") or "") == "online" and ts - node_last_seen <= offline_after_seconds
+            item["node_offline_seconds"] = max(0, ts - node_last_seen) if node_last_seen else None
+            item["display_name"] = item.get("profile_name") or item.get("x_username") or item.get("profile_id")
             result.append(item)
         return result
 
@@ -1494,10 +1797,12 @@ class Storage:
         job_ids = []
         cleaned_plans = 0
         cleaned_tasks = 0
+        cleaned_jobs = 0
         for account in accounts:
             cleanup = self.invalidate_old_score_plans(account["profile_id"])
             cleaned_plans += cleanup["plans"]
             cleaned_tasks += cleanup["tasks"]
+            cleaned_jobs += int(cleanup.get("jobs", 0))
             job_id = self.create_job(
                 job_type=JOB_SCORE_GROK_PLAN,
                 target_node_id=account["node_id"],
@@ -1530,11 +1835,23 @@ class Storage:
                     ),
                 )
             job_ids.append(job_id)
-        return {"job_ids": job_ids, "cleaned_plans": cleaned_plans, "cleaned_tasks": cleaned_tasks}
+        return {"job_ids": job_ids, "cleaned_plans": cleaned_plans, "cleaned_tasks": cleaned_tasks, "cleaned_jobs": cleaned_jobs}
 
     def invalidate_old_score_plans(self, account_id: str) -> Dict[str, int]:
         ts = now_ts()
         with self.connect() as conn:
+            direct_job_rows = conn.execute(
+                """
+                SELECT id, status FROM jobs
+                WHERE job_type = 'score_grok_plan'
+                  AND status IN ('queued', 'leased')
+                  AND (
+                    json_extract(payload_json, '$.account_id') = ?
+                    OR json_extract(payload_json, '$.profile_id') = ?
+                  )
+                """,
+                (account_id, account_id),
+            ).fetchall()
             plan_rows = conn.execute(
                 """
                 SELECT id FROM account_plans
@@ -1543,33 +1860,38 @@ class Storage:
                 (account_id,),
             ).fetchall()
             plan_ids = [int(row["id"]) for row in plan_rows]
-            if not plan_ids:
-                return {"plans": 0, "tasks": 0}
-            placeholders = ",".join("?" for _ in plan_ids)
-            task_count = conn.execute(
-                f"""
-                SELECT COUNT(*) AS c FROM scheduled_tasks
-                WHERE plan_id IN ({placeholders})
-                  AND status IN ('scheduled', 'paused', 'dispatched')
-                """,
-                plan_ids,
-            ).fetchone()["c"]
-            job_rows = conn.execute(
-                f"""
-                SELECT id, status FROM jobs
-                WHERE status IN ('queued', 'leased')
-                  AND (
-                    id IN (
-                      SELECT job_id FROM scheduled_tasks
-                      WHERE plan_id IN ({placeholders}) AND job_id IS NOT NULL
-                    )
-                    OR json_extract(payload_json, '$.plan_id') IN ({placeholders})
-                  )
-                """,
-                [*plan_ids, *plan_ids],
-            ).fetchall()
+            task_count = 0
+            job_rows = list(direct_job_rows)
+            if plan_ids:
+                placeholders = ",".join("?" for _ in plan_ids)
+                task_count = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS c FROM scheduled_tasks
+                    WHERE plan_id IN ({placeholders})
+                      AND status IN ('scheduled', 'paused', 'dispatched')
+                    """,
+                    plan_ids,
+                ).fetchone()["c"]
+                job_rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT id, status FROM jobs
+                        WHERE status IN ('queued', 'leased')
+                          AND (
+                            id IN (
+                              SELECT job_id FROM scheduled_tasks
+                              WHERE plan_id IN ({placeholders}) AND job_id IS NOT NULL
+                            )
+                            OR json_extract(payload_json, '$.plan_id') IN ({placeholders})
+                          )
+                        """,
+                        [*plan_ids, *plan_ids],
+                    ).fetchall()
+                )
             queued_job_ids = [int(row["id"]) for row in job_rows if row["status"] == "queued"]
             leased_job_ids = [int(row["id"]) for row in job_rows if row["status"] == "leased"]
+            queued_job_ids = sorted(set(queued_job_ids))
+            leased_job_ids = sorted(set(leased_job_ids))
             if queued_job_ids:
                 job_placeholders = ",".join("?" for _ in queued_job_ids)
                 conn.execute(
@@ -1590,24 +1912,26 @@ class Storage:
                     """,
                     [ts, *leased_job_ids],
                 )
-            conn.execute(
-                f"""
-                UPDATE scheduled_tasks
-                SET status = 'cancelled_by_new_plan', updated_at = ?
-                WHERE plan_id IN ({placeholders})
-                  AND status IN ('scheduled', 'paused', 'dispatched')
-                """,
-                [ts, *plan_ids],
-            )
-            conn.execute(
-                f"""
-                UPDATE account_plans
-                SET status = 'superseded', is_current = 0, updated_at = ?
-                WHERE id IN ({placeholders})
-                """,
-                [ts, *plan_ids],
-            )
-        return {"plans": len(plan_ids), "tasks": int(task_count or 0)}
+            if plan_ids:
+                placeholders = ",".join("?" for _ in plan_ids)
+                conn.execute(
+                    f"""
+                    UPDATE scheduled_tasks
+                    SET status = 'cancelled_by_new_plan', updated_at = ?
+                    WHERE plan_id IN ({placeholders})
+                      AND status IN ('scheduled', 'paused', 'dispatched')
+                    """,
+                    [ts, *plan_ids],
+                )
+                conn.execute(
+                    f"""
+                    UPDATE account_plans
+                    SET status = 'superseded', is_current = 0, updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    [ts, *plan_ids],
+                )
+        return {"plans": len(plan_ids), "tasks": int(task_count or 0), "jobs": len(queued_job_ids) + len(leased_job_ids)}
 
     def create_legacy_mode_jobs(
         self,
@@ -1762,21 +2086,30 @@ class Storage:
         limit: int = 100,
         current_only: bool = False,
     ) -> list[Dict[str, Any]]:
-        sql = "SELECT * FROM account_plans WHERE 1=1"
+        sql = """
+            SELECT
+                account_plans.*,
+                accounts.profile_name AS account_name,
+                accounts.x_username AS account_username,
+                accounts.node_id AS account_node_id
+            FROM account_plans
+            LEFT JOIN accounts ON accounts.profile_id = account_plans.account_id
+            WHERE 1=1
+        """
         params: list[Any] = []
         if account_id:
-            sql += " AND account_id = ?"
+            sql += " AND account_plans.account_id = ?"
             params.append(account_id)
         group_id = self.resolve_group_id(group_id)
         if group_id:
-            sql += " AND group_id = ?"
+            sql += " AND account_plans.group_id = ?"
             params.append(group_id)
         if status:
-            sql += " AND status = ?"
+            sql += " AND account_plans.status = ?"
             params.append(status)
         if current_only:
-            sql += " AND COALESCE(is_current, 1) = 1"
-        sql += " ORDER BY id DESC LIMIT ?"
+            sql += " AND COALESCE(account_plans.is_current, 1) = 1"
+        sql += " ORDER BY account_plans.id DESC LIMIT ?"
         params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -1785,6 +2118,8 @@ class Storage:
             item = dict(row)
             item["parsed_plan"] = json.loads(item.pop("parsed_plan_json") or "{}")
             item["task_summary"] = self.scheduled_task_summary(plan_id=int(item["id"]))
+            name = item.get("account_name") or item.get("account_username") or item.get("account_id")
+            item["account_display"] = f"{name} (profile={item.get('account_id')})"
             result.append(item)
         return result
 
@@ -1841,6 +2176,14 @@ class Storage:
         item = dict(row)
         item["parsed_plan"] = json.loads(item.pop("parsed_plan_json") or "{}")
         item["task_summary"] = self.scheduled_task_summary(plan_id=int(item["id"]))
+        account = self.get_account(str(item.get("account_id") or ""))
+        if account:
+            name = account.get("profile_name") or account.get("x_username") or item.get("account_id")
+            item["account_name"] = name
+            item["account_display"] = f"{name} (profile={item.get('account_id')})"
+            item["account_node_id"] = account.get("node_id")
+        else:
+            item["account_display"] = str(item.get("account_id") or "")
         return item
 
     def scheduled_task_summary(self, plan_id: Optional[int] = None, account_id: Optional[str] = None) -> Dict[str, int]:

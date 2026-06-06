@@ -251,6 +251,15 @@ class ControllerHandler(BaseHTTPRequestHandler):
             job = self.storage.lease_next_job(node_id)
             write_json(self, 200, {"ok": True, "job": job})
             return
+        if parsed.path == "/worker/config":
+            query = parse_qs(parsed.query)
+            node_id = query.get("node_id", [""])[0]
+            if not node_id:
+                write_json(self, 400, {"ok": False, "error": "missing node_id"})
+                return
+            config = self.storage.get_worker_config(node_id, mask_secrets=False)
+            write_json(self, 200, {"ok": True, "config": config})
+            return
         if parsed.path == "/accounts":
             query = parse_qs(parsed.query)
             accounts = self.storage.list_accounts(
@@ -654,11 +663,12 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/api/workers":
                 workers = self.storage.list_workers(limit=int(query.get("limit", ["200"])[0]))
-                now = int(time.time())
-                for worker in workers:
-                    worker["online"] = worker.get("status") == "online" and now - int(worker.get("last_seen") or 0) <= 90
-                    worker["offline_seconds"] = max(0, now - int(worker.get("last_seen") or 0))
                 write_json(self, 200, {"ok": True, "workers": workers, "count": len(workers)})
+                return
+            if path.startswith("/admin/api/workers/") and path.endswith("/config"):
+                node_id = path.split("/")[4]
+                config = self.storage.get_worker_config(node_id, mask_secrets=True)
+                write_json(self, 200, {"ok": True, "config": config})
                 return
             if path == "/admin/api/groups":
                 groups = self.storage.list_groups(limit=int(query.get("limit", ["300"])[0]))
@@ -749,6 +759,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 write_json(self, 200, {"ok": True, "logs": logs, "count": len(logs)})
                 return
             if path == "/admin/api/settings":
+                default_worker = self.storage.get_worker_default_config(mask_secrets=True)
                 write_json(
                     self,
                     200,
@@ -759,6 +770,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                             "token_fingerprint": hashlib.sha256(self.api_token.encode("utf-8")).hexdigest()[:12],
                             "db_path": str(self.storage.db_path),
                             "web_root": str(self.web_root),
+                            "worker_default_config": default_worker,
                         },
                     },
                 )
@@ -799,6 +811,36 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 result = self.storage.cancel_job(job_id, payload.get("reason", "cancelled_by_admin"))
                 self._audit(user, "cancel_job", "job", str(job_id), {"result": result})
                 write_json(self, 200, {"ok": True, **result})
+                return
+            if path == "/admin/api/jobs/bulk":
+                job_ids = [int(item) for item in payload.get("job_ids", [])]
+                action = str(payload.get("action") or "")
+                if action != "cancel":
+                    write_json(self, 400, {"ok": False, "error": "invalid bulk action"})
+                    return
+                result = self.storage.bulk_cancel_jobs(job_ids, payload.get("reason", "cancelled_by_admin_bulk"))
+                self._audit(user, "bulk_cancel_jobs", "job", ",".join(map(str, job_ids)), {"result": result})
+                write_json(self, 200, {"ok": True, **result})
+                return
+            if path == "/admin/api/maintenance/cleanup-stale":
+                result = self.storage.cleanup_stale_jobs(
+                    grace_seconds=int(payload.get("grace_seconds", 3600)),
+                    include_score_jobs=bool(payload.get("include_score_jobs", False)),
+                    include_legacy_scheduled=True,
+                )
+                self._audit(user, "cleanup_stale_jobs", "maintenance", "stale_jobs", {"result": result})
+                write_json(self, 200, {"ok": True, **result})
+                return
+            if path.startswith("/admin/api/workers/") and path.endswith("/config"):
+                node_id = path.split("/")[4]
+                config = self.storage.update_worker_config(node_id, payload)
+                self._audit(user, "update_worker_config", "worker", node_id, {"keys": sorted(payload.keys())})
+                write_json(self, 200, {"ok": True, "config": config})
+                return
+            if path == "/admin/api/worker-default-config":
+                config = self.storage.update_worker_default_config(payload)
+                self._audit(user, "update_worker_default_config", "setting", "worker_default_config", {"keys": sorted(payload.keys())})
+                write_json(self, 200, {"ok": True, "config": config})
                 return
             if path.startswith("/admin/api/score-plans/"):
                 parts = path.strip("/").split("/")

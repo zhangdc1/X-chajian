@@ -80,7 +80,10 @@ class CentralClient:
         self.token = token
 
     def workers(self) -> Dict[str, Any]:
-        return http_json("GET", f"{self.api}/workers", self.token)
+        data = http_json("GET", f"{self.api}/workers", self.token)
+        for item in data.get("workers", []) or []:
+            item["status"] = "online" if item.get("online") else "offline"
+        return data
 
     def groups(self) -> Dict[str, Any]:
         return http_json("GET", f"{self.api}/groups", self.token)
@@ -195,7 +198,11 @@ class CentralClient:
         query = {"limit": str(limit)}
         if group_id:
             query["group_id"] = group_id
-        return http_json("GET", f"{self.api}/score-plans?{parse.urlencode(query)}", self.token)
+        data = http_json("GET", f"{self.api}/score-plans?{parse.urlencode(query)}", self.token)
+        for item in data.get("plans", []) or []:
+            if item.get("account_display"):
+                item["account_id"] = item["account_display"]
+        return data
 
     def schedule_score_plan(self, plan_id: int) -> Dict[str, Any]:
         return http_json("POST", f"{self.api}/score-plans/{plan_id}/schedule", self.token, {"max_days": 31})
@@ -903,6 +910,32 @@ def summarize_command(command: Dict[str, Any]) -> str:
     return f"执行动作：{action}"
 
 
+def build_help() -> str:
+    return (
+        f"X-bot 常用指令 {BOT_VERSION}\n"
+        "\n"
+        "一、日常执行\n"
+        "!模式一 测试              养号\n"
+        "!模式二 测试 链接=https://x.com/xxx/status/123   冲贴，最高优先级\n"
+        "!模式三 测试              发帖\n"
+        "\n"
+        "二、账号评分计划\n"
+        "!账号评分 测试 周计划      生成7天账号提升计划\n"
+        "\n"
+        "三、电脑/分组/账号\n"
+        "!查看电脑状态\n"
+        "!查看分组\n"
+        "!查看账号 测试\n"
+        "!绑定 测试 group_id [PC-01]\n"
+        "!解绑 测试\n"
+        "!同步分组 PC-01 group_id\n"
+    )
+
+
+def build_full_help() -> str:
+    return build_help()
+
+
 async def run_bot(config: Dict[str, Any]) -> None:
     try:
         import discord
@@ -976,9 +1009,6 @@ def build_discord_client(discord: Any, central: CentralClient, prefix: str, allo
             content = content[len(prefix):].strip()
         raw_content = content
         command = maybe_semantic_command(parse_command(content), raw_content, config)
-        if command.get("semantic") and command.get("action") in HIGH_RISK_ACTIONS and command.get("needs_confirm", True):
-            await message.channel.send(build_confirmation(command)[:1900])
-            return
         try:
             response, job_ids = format_response(command, central)
         except Exception as exc:

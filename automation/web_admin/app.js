@@ -2,6 +2,7 @@ const state = {
   section: "dashboard",
   user: "",
   selectedTaskIds: new Set(),
+  selectedJobIds: new Set(),
 };
 
 const titles = {
@@ -403,6 +404,137 @@ async function resetPrompt() {
   $("scorePrompt").value = data.prompt || "";
 }
 
+async function loadWorkers() {
+  const data = await api("/admin/api/workers?limit=200");
+  $("workersTable").innerHTML = table(["电脑", "标签", "在线", "Grok", "同步分组", "当前任务", "最后心跳", "操作"], data.workers.map(w => {
+    const cfg = w.central_config || {};
+    const groups = cfg.sync_group_ids || [];
+    const current = (w.meta || {}).current_job || {};
+    return `<tr>
+      <td>${esc(w.node_id)}</td>
+      <td>${esc(w.label)}</td>
+      <td>${w.online ? statusPill("online") : statusPill("offline")}</td>
+      <td>${cfg.enable_grok_browser ? statusPill("开启") : statusPill("关闭")}</td>
+      <td class="wrap">${esc(Array.isArray(groups) ? groups.join(", ") : groups)}</td>
+      <td class="wrap">${current.id ? `job=${esc(current.id)} ${esc(current.job_type || "")}` : "-"}</td>
+      <td>${fmtTime(w.last_seen)}<div class="small muted">${w.offline_seconds || 0} 秒前</div></td>
+      <td>
+        <button class="ghost" onclick="editWorkerConfig('${esc(w.node_id)}')">配置</button>
+        <button class="ghost" onclick='showDetail("电脑详情", ${JSON.stringify(w).replaceAll("'", "&#39;")})'>详情</button>
+      </td>
+    </tr>`;
+  }));
+}
+
+async function loadAccounts(groupId = "") {
+  if (groupId) $("accountFilter").value = groupId;
+  const query = new URLSearchParams();
+  const filter = $("accountFilter").value.trim();
+  if (filter) query.set("group_id", filter);
+  query.set("include_inactive", $("includeInactive").checked ? "1" : "0");
+  query.set("limit", "1000");
+  const data = await api(`/admin/api/accounts?${query.toString()}`);
+  $("accountsTable").innerHTML = table(["账号", "profile_id", "分组", "电脑", "账号状态", "电脑在线", "最后同步", "操作"], data.accounts.map(a => `
+    <tr>
+      <td>${esc(a.display_name || a.profile_name || a.x_username || "-")}</td>
+      <td>${esc(a.profile_id)}</td>
+      <td>${esc(a.group_id || "-")}</td>
+      <td>${esc(a.node_id || "-")}</td>
+      <td>${statusPill(a.status)}</td>
+      <td>${a.node_online ? statusPill("online") : statusPill("offline")}</td>
+      <td>${fmtTime(a.last_seen)}</td>
+      <td>
+        <button class="ghost" onclick="accountTimeline('${esc(a.profile_id)}')">时间线</button>
+        ${a.status === "active"
+          ? `<button class="ghost danger" onclick="setAccountStatus('${esc(a.profile_id)}','inactive')">停用</button>`
+          : `<button class="ghost" onclick="setAccountStatus('${esc(a.profile_id)}','active')">恢复</button>`}
+      </td>
+    </tr>`));
+}
+
+async function loadJobs() {
+  state.selectedJobIds.clear();
+  const query = new URLSearchParams();
+  if ($("jobStatus").value) query.set("status", $("jobStatus").value);
+  if ($("jobNode").value.trim()) query.set("node_id", $("jobNode").value.trim());
+  query.set("limit", "300");
+  const data = await api(`/admin/api/jobs?${query.toString()}`);
+  $("jobsTable").innerHTML = table(["选择", "ID", "类型", "模式", "优先级", "电脑", "状态", "错误", "更新", "操作"], data.jobs.map(j => `
+    <tr>
+      <td><input type="checkbox" onchange="toggleJob(${j.id}, this.checked)"></td>
+      <td>${j.id}</td>
+      <td>${esc(j.job_type)}</td>
+      <td>${esc((j.payload || {}).mode || "-")}</td>
+      <td>${j.priority || 10}${(j.priority || 0) >= 100 ? ' <span class="pill blue">最高</span>' : ""}</td>
+      <td>${esc(j.leased_by || j.target_node_id || "-")}</td>
+      <td>${statusPill(j.status)}</td>
+      <td class="wrap">${esc(j.error || "")}</td>
+      <td>${fmtTime(j.updated_at)}</td>
+      <td>
+        <button class="ghost" onclick="jobDetail(${j.id})">日志</button>
+        ${["queued", "leased"].includes(j.status) ? `<button class="ghost danger" onclick="cancelJob(${j.id})">取消</button>` : ""}
+      </td>
+    </tr>`));
+}
+
+async function loadPlans() {
+  const query = new URLSearchParams();
+  if ($("planGroup").value.trim()) query.set("group_id", $("planGroup").value.trim());
+  query.set("limit", "300");
+  const data = await api(`/admin/api/score-plans?${query.toString()}`);
+  $("plansTable").innerHTML = table(["ID", "账号", "分组", "评分", "状态", "来源", "调度", "创建", "操作"], data.plans.map(p => `
+    <tr>
+      <td>${p.id}</td>
+      <td>${esc(p.account_display || p.account_name || p.account_id)}</td>
+      <td>${esc(p.group_id || "-")}</td>
+      <td>${esc(p.score ?? "-")}</td>
+      <td>${statusPill(p.status)}</td>
+      <td>${esc(p.source_job_id || "-")}</td>
+      <td>${esc(JSON.stringify(p.task_summary || {}))}</td>
+      <td>${fmtTime(p.created_at)}</td>
+      <td>
+        <button class="ghost" onclick="planDetail(${p.id})">详情</button>
+        <button class="ghost" onclick="planAction(${p.id}, 'pause')">暂停</button>
+        <button class="ghost" onclick="planAction(${p.id}, 'resume')">恢复</button>
+        <button class="ghost danger" onclick="planAction(${p.id}, 'delete')">删除</button>
+      </td>
+    </tr>`));
+  await loadPrompt();
+}
+
+function toggleJob(jobId, checked) {
+  if (checked) state.selectedJobIds.add(jobId);
+  else state.selectedJobIds.delete(jobId);
+}
+
+async function bulkCancelJobs() {
+  const job_ids = [...state.selectedJobIds];
+  if (!job_ids.length) return alert("请先勾选任务");
+  if (!confirm(`确认取消 ${job_ids.length} 个任务？`)) return;
+  await api("/admin/api/jobs/bulk", { method: "POST", body: JSON.stringify({ action: "cancel", job_ids }) });
+  await loadJobs();
+}
+
+async function cleanupStaleJobs() {
+  if (!confirm("确认清理过期自动任务和旧队列？")) return;
+  const data = await api("/admin/api/maintenance/cleanup-stale", { method: "POST", body: JSON.stringify({ grace_seconds: 3600, include_score_jobs: true }) });
+  alert(`已清理：调度过期 ${data.scheduled_expired || 0}，队列取消 ${data.jobs_cancelled || 0}`);
+  await loadJobs();
+}
+
+async function editWorkerConfig(nodeId) {
+  const data = await api(`/admin/api/workers/${encodeURIComponent(nodeId)}/config`);
+  const cfg = data.config || {};
+  const label = prompt("电脑标签", cfg.label || nodeId);
+  if (label === null) return;
+  const grok = confirm("是否开启 Grok 浏览器？点击取消则关闭。");
+  await api(`/admin/api/workers/${encodeURIComponent(nodeId)}/config`, {
+    method: "POST",
+    body: JSON.stringify({ label, enable_grok_browser: grok, open_gui_for_legacy: false }),
+  });
+  await loadWorkers();
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   $("loginForm").addEventListener("submit", login);
   $("logoutBtn").addEventListener("click", logout);
@@ -413,6 +545,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("addSyncGroupBtn").addEventListener("click", addSyncGroup);
   $("loadAccountsBtn").addEventListener("click", () => loadAccounts());
   $("loadJobsBtn").addEventListener("click", loadJobs);
+  $("bulkCancelJobsBtn").addEventListener("click", bulkCancelJobs);
+  $("cleanupStaleBtn").addEventListener("click", cleanupStaleJobs);
   $("loadPlansBtn").addEventListener("click", loadPlans);
   $("loadScheduleBtn").addEventListener("click", loadSchedule);
   $("bulkPauseBtn").addEventListener("click", () => bulkTask("pause"));
@@ -434,3 +568,7 @@ window.planDetail = planDetail;
 window.planAction = planAction;
 window.toggleTask = toggleTask;
 window.taskAction = taskAction;
+window.toggleJob = toggleJob;
+window.bulkCancelJobs = bulkCancelJobs;
+window.cleanupStaleJobs = cleanupStaleJobs;
+window.editWorkerConfig = editWorkerConfig;
