@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XBot 中央控制器</title>
+  <link rel="stylesheet" href="/admin/styles.css">
+</head>
+<body>
+  <div id="loginView" class="login-shell hidden">
+    <form id="loginForm" class="login-panel">
+      <div class="brand">XBot Admin</div>
+      <h1>中央控制器</h1>
+      <label>
+        <span>管理员</span>
+        <input id="loginUser" autocomplete="username" value="admin">
+      </label>
+      <label>
+        <span>密码</span>
+        <input id="loginPass" type="password" autocomplete="current-password">
+      </label>
+      <button type="submit">登录</button>
+      <p id="loginError" class="error-line"></p>
+    </form>
+  </div>
+
+  <div id="appView" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="logo">XBot</div>
+      <nav id="nav">
+        <button data-section="dashboard" class="active">仪表盘</button>
+        <button data-section="workers">电脑管理</button>
+        <button data-section="groups">分组账号</button>
+        <button data-section="jobs">任务中心</button>
+        <button data-section="plans">账号评分</button>
+        <button data-section="schedule">调度任务</button>
+        <button data-section="audit">审计设置</button>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">仪表盘</h1>
+          <p id="pageSubtitle">系统健康、任务和异常集中视图</p>
+        </div>
+        <div class="top-actions">
+          <span id="userBadge" class="badge"></span>
+          <button id="refreshBtn" class="ghost">刷新</button>
+          <button id="logoutBtn" class="ghost danger">退出</button>
+        </div>
+      </header>
+
+      <section id="dashboard" class="section active">
+        <div id="statGrid" class="stat-grid"></div>
+        <div class="grid-two">
+          <div class="panel">
+            <div class="panel-head"><h2>执行中任务</h2></div>
+            <div id="runningJobs"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>今日异常</h2></div>
+            <div id="todayIssues"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="workers" class="section">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>电脑列表</h2>
+            <div class="inline-form">
+              <input id="syncNodeId" placeholder="node_id">
+              <input id="syncGroupId" placeholder="group_id">
+              <button id="addSyncGroupBtn">添加同步分组</button>
+            </div>
+          </div>
+          <div id="workersTable"></div>
+        </div>
+      </section>
+
+      <section id="groups" class="section">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>分组别名</h2>
+            <div class="inline-form">
+              <input id="aliasName" placeholder="别名">
+              <input id="aliasGroupId" placeholder="group_id">
+              <button id="bindAliasBtn">绑定/改名</button>
+            </div>
+          </div>
+          <div id="groupsTable"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>账号列表</h2>
+            <div class="inline-form">
+              <input id="accountFilter" placeholder="group_id / alias">
+              <label class="check"><input id="includeInactive" type="checkbox" checked>含停用</label>
+              <button id="loadAccountsBtn">查询</button>
+            </div>
+          </div>
+          <div id="accountsTable"></div>
+        </div>
+      </section>
+
+      <section id="jobs" class="section">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>任务中心</h2>
+            <div class="inline-form">
+              <select id="jobStatus">
+                <option value="">全部状态</option>
+                <option>queued</option>
+                <option>leased</option>
+                <option>completed</option>
+                <option>failed</option>
+                <option>cancelled</option>
+                <option>cancel_requested</option>
+                <option>preempted</option>
+              </select>
+              <input id="jobNode" placeholder="node_id">
+              <button id="loadJobsBtn">查询</button>
+            </div>
+          </div>
+          <div id="jobsTable"></div>
+        </div>
+      </section>
+
+      <section id="plans" class="section">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>评分计划</h2>
+            <div class="inline-form">
+              <input id="planGroup" placeholder="group_id / alias">
+              <button id="loadPlansBtn">查询</button>
+            </div>
+          </div>
+          <div id="plansTable"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>中央评分提示词</h2></div>
+          <textarea id="scorePrompt" rows="12"></textarea>
+          <div class="row-actions">
+            <button id="savePromptBtn">保存提示词</button>
+            <button id="resetPromptBtn" class="ghost danger">恢复默认</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="schedule" class="section">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>调度任务</h2>
+            <div class="inline-form">
+              <select id="taskStatus">
+                <option value="">全部状态</option>
+                <option>scheduled</option>
+                <option>paused</option>
+                <option>dispatched</option>
+                <option>completed</option>
+                <option>failed</option>
+                <option>expired_missed</option>
+                <option>cancelled_by_user</option>
+              </select>
+              <button id="loadScheduleBtn">查询</button>
+              <button id="bulkPauseBtn" class="ghost">批量暂停</button>
+              <button id="bulkResumeBtn" class="ghost">批量恢复</button>
+              <button id="bulkCancelBtn" class="ghost danger">批量取消</button>
+            </div>
+          </div>
+          <div id="scheduleTable"></div>
+        </div>
+      </section>
+
+      <section id="audit" class="section">
+        <div class="grid-two">
+          <div class="panel">
+            <div class="panel-head"><h2>操作审计</h2></div>
+            <div id="auditTable"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>系统设置</h2></div>
+            <div id="settingsBox"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="detailDialog">
+    <div class="dialog-head">
+      <h2 id="dialogTitle">详情</h2>
+      <button id="closeDialog" class="ghost">关闭</button>
+    </div>
+    <pre id="dialogBody"></pre>
+  </dialog>
+
+  <script src="/admin/app.js"></script>
+</body>
+</html>

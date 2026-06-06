@@ -44,3 +44,5 @@ fi
 curl -fsS http://127.0.0.1:8766/health || true
 echo
 echo "server update done"
+echo "admin panel: http://YOUR_SERVER_IP:8766/admin"
+echo "set admin password with XBOT_ADMIN_PASSWORD in xbot-controller systemd environment"

@@ -121,6 +121,18 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value_text TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS admin_audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT,
+    target_id TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    ok INTEGER NOT NULL DEFAULT 1,
+    ip TEXT,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -158,6 +170,37 @@ DEFAULT_SCORE_PROMPT = """请帮我制定一份社交媒体账号权重提升计
 
 请直接输出 7 天的表格（第1天到第7天），不要额外解释。表格中手动搜索量必须为 1 或 2。"""
 
+DEFAULT_SCORE_PROMPT = """请帮我制定一份社交媒体账号权重提升计划，要求如下：
+一、计划目标
+一周内将账号权重从当前分数提升到60分（满分100分），今天是第一天。
+
+二、输出格式
+只输出表格，不要任何文字说明。每天单独一个表格。
+
+三、每天表格结构
+- 第一列：时间（每天随机生成5个具体时间点，范围09:00-22:30，时间点之间至少间隔约90分钟；不同天可以不同，不要固定为09:00/12:00/15:00/18:00/21:00）
+- 其余列：点赞量、收藏量、转帖量、评论量、关注量、发帖量、手动搜索量
+- 每个单元格必须是具体的整数，禁止出现“全天分散”、“各时段执行”、“区间合并”（如08:00-09:00）等写法
+
+四、重要定义与数值范围（请严格遵守）
+1. 手动搜索量：指“主动输入行业关键词并点击搜索”的次数。每次独立搜索（输入关键词+按确认）计为1。不是浏览结果的点赞或停留时间。
+   - 每个时间点手动搜索量必须为1或2，全天不超过10。
+   - 禁止出现大于5的数值。
+2. 其他指标的合理范围（每时间点）：
+   - 点赞量：15~35
+   - 收藏量：3~12
+   - 转帖量：2~8
+   - 评论量：2~12
+   - 关注量：2~5
+   - 发帖量：0或1
+3. 每天总关注量不超过20，总发帖量不超过3。
+
+五、计划周期
+- 第一天：从今天开始，随机生成5个09:00-22:30内的具体时间点执行。
+- 后面六天：格式与第一天完全相同，每天也随机生成5个具体时间点；数值可逐日微增，但不得超出上述范围。
+
+请直接输出7天的表格（第1天到第7天），不要额外解释。表格中手动搜索量必须为1或2。"""
+
 
 def now_ts() -> int:
     return int(time.time())
@@ -194,6 +237,216 @@ class Storage:
             self._dedupe_active_group_aliases(conn)
             self._ensure_default_score_prompt(conn)
             self.cancel_legacy_grok_score_jobs(conn)
+
+    def admin_dashboard(self, offline_after_seconds: int = 90) -> Dict[str, Any]:
+        ts = now_ts()
+        today_start = ts - (ts % 86400)
+        offline_cutoff = ts - int(offline_after_seconds)
+        with self.connect() as conn:
+            worker_rows = conn.execute("SELECT * FROM worker_nodes ORDER BY last_seen DESC LIMIT 100").fetchall()
+            job_status_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM jobs
+                WHERE created_at >= ?
+                GROUP BY status
+                """,
+                (today_start,),
+            ).fetchall()
+            schedule_status_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM scheduled_tasks
+                WHERE run_at >= ?
+                GROUP BY status
+                """,
+                (today_start,),
+            ).fetchall()
+            account_rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM accounts GROUP BY status"
+            ).fetchall()
+            running_rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('leased', 'cancel_requested')
+                ORDER BY updated_at DESC
+                LIMIT 20
+                """
+            ).fetchall()
+            recent_fail_rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('failed', 'cancel_requested')
+                  AND updated_at >= ?
+                ORDER BY updated_at DESC
+                LIMIT 20
+                """,
+                (today_start,),
+            ).fetchall()
+            missed_rows = conn.execute(
+                """
+                SELECT * FROM scheduled_tasks
+                WHERE status = 'expired_missed'
+                ORDER BY updated_at DESC
+                LIMIT 20
+                """
+            ).fetchall()
+
+        workers = []
+        online_count = 0
+        long_offline_count = 0
+        for row in worker_rows:
+            item = dict(row)
+            item["meta"] = json.loads(item.pop("meta_json") or "{}")
+            is_online = str(item.get("status") or "") == "online" and int(item.get("last_seen") or 0) >= offline_cutoff
+            item["online"] = is_online
+            item["offline_seconds"] = max(0, ts - int(item.get("last_seen") or 0))
+            online_count += 1 if is_online else 0
+            long_offline_count += 1 if item["offline_seconds"] > 600 else 0
+            workers.append(item)
+
+        account_counts = {str(row["status"]): int(row["count"]) for row in account_rows}
+        job_counts = {str(row["status"]): int(row["count"]) for row in job_status_rows}
+        schedule_counts = {str(row["status"]): int(row["count"]) for row in schedule_status_rows}
+        running_jobs = [self._decode_job_row(row) for row in running_rows]
+        recent_failures = [self._decode_job_row(row) for row in recent_fail_rows]
+        missed_tasks = [self._decode_scheduled_task_row(row) for row in missed_rows]
+        return {
+            "now": ts,
+            "stats": {
+                "workers_online": online_count,
+                "workers_offline": max(0, len(workers) - online_count),
+                "workers_long_offline": long_offline_count,
+                "accounts_active": account_counts.get("active", 0),
+                "accounts_inactive": sum(v for k, v in account_counts.items() if k != "active"),
+                "jobs_today": sum(job_counts.values()),
+                "jobs_failed_today": job_counts.get("failed", 0),
+                "jobs_running": job_counts.get("leased", 0) + job_counts.get("cancel_requested", 0),
+                "jobs_queued": job_counts.get("queued", 0),
+                "schedule_pending_today": schedule_counts.get("scheduled", 0),
+                "schedule_missed_today": schedule_counts.get("expired_missed", 0),
+            },
+            "workers": workers,
+            "running_jobs": running_jobs,
+            "recent_failures": recent_failures,
+            "missed_tasks": missed_tasks,
+        }
+
+    @staticmethod
+    def default_score_prompt() -> str:
+        return DEFAULT_SCORE_PROMPT
+
+    def add_admin_audit(
+        self,
+        actor: str,
+        action: str,
+        target_type: str = "",
+        target_id: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+        ok: bool = True,
+        ip: str = "",
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO admin_audit_logs (
+                    actor, action, target_type, target_id, detail_json, ok, ip, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    actor or "admin",
+                    action,
+                    target_type or "",
+                    str(target_id or ""),
+                    json.dumps(detail or {}, ensure_ascii=False),
+                    1 if ok else 0,
+                    ip or "",
+                    now_ts(),
+                ),
+            )
+
+    def list_admin_audit(self, limit: int = 100) -> list[Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM admin_audit_logs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            result.append(item)
+        return result
+
+    def account_timeline(self, profile_id: str, limit: int = 100) -> list[Dict[str, Any]]:
+        with self.connect() as conn:
+            job_rows = conn.execute(
+                """
+                SELECT *
+                FROM jobs
+                WHERE json_extract(payload_json, '$.profile_id') = ?
+                   OR json_extract(payload_json, '$.account_id') = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (profile_id, profile_id, limit),
+            ).fetchall()
+            task_rows = conn.execute(
+                """
+                SELECT *
+                FROM scheduled_tasks
+                WHERE account_id = ?
+                ORDER BY run_at DESC
+                LIMIT ?
+                """,
+                (profile_id, limit),
+            ).fetchall()
+        events: list[Dict[str, Any]] = []
+        for row in job_rows:
+            job = self._decode_job_row(row)
+            events.append(
+                {
+                    "kind": "job",
+                    "id": job["id"],
+                    "status": job["status"],
+                    "title": job["job_type"],
+                    "time": job["updated_at"],
+                    "payload": job.get("payload", {}),
+                    "error": job.get("error") or "",
+                }
+            )
+        for row in task_rows:
+            task = self._decode_scheduled_task_row(row)
+            events.append(
+                {
+                    "kind": "scheduled_task",
+                    "id": task["id"],
+                    "status": task["status"],
+                    "title": task["job_type"],
+                    "time": task["run_at"],
+                    "payload": task.get("payload", {}),
+                    "error": task.get("last_error") or "",
+                }
+            )
+        events.sort(key=lambda item: int(item.get("time") or 0), reverse=True)
+        return events[:limit]
+
+    @staticmethod
+    def _decode_job_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        item["result"] = json.loads(item.pop("result_json") or "{}")
+        return item
+
+    @staticmethod
+    def _decode_scheduled_task_row(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        return item
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
