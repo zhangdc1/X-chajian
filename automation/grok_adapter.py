@@ -1,7 +1,7 @@
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 
 @dataclass
@@ -17,7 +17,12 @@ class GrokBrowserAdapter:
     def __init__(self, settings: Dict[str, Any]):
         self.settings = settings
 
-    def ask_with_debug_port(self, debug_port: int, prompt: str) -> GrokResult:
+    def ask_with_debug_port(
+        self,
+        debug_port: int,
+        prompt: str,
+        response_validator: Optional[Callable[[str], bool]] = None,
+    ) -> GrokResult:
         try:
             from DrissionPage import ChromiumOptions, ChromiumPage
         except Exception as exc:
@@ -49,7 +54,7 @@ class GrokBrowserAdapter:
             if not self._send_prompt(page, input_ele):
                 return GrokResult(False, "", "Grok 提示词已输入但发送按钮未激活，已停止，避免生成错误计划")
 
-            raw = self._wait_for_response(page)
+            raw = self._wait_for_response(page, response_validator=response_validator)
             if not raw:
                 return GrokResult(False, "", "Grok response text not found")
             return GrokResult(True, raw)
@@ -383,12 +388,15 @@ class GrokBrowserAdapter:
 
         return json.dumps(text, ensure_ascii=False)
 
-    def _wait_for_response(self, page: Any) -> str:
+    def _wait_for_response(self, page: Any, response_validator: Optional[Callable[[str], bool]] = None) -> str:
         timeout = float(self.settings.get("response_timeout_seconds", 120))
         poll = float(self.settings.get("response_poll_seconds", 3))
+        required_stable = max(2, int(self.settings.get("response_stable_polls", 4 if response_validator else 2) or 2))
+        extra_after_valid = max(0, int(self.settings.get("response_valid_extra_polls", 1) or 0))
         end = time.time() + timeout
         last_text = ""
         stable_count = 0
+        valid_count = 0
         while time.time() < end:
             text = self._extract_response_text(page)
             if text and text == last_text:
@@ -396,7 +404,16 @@ class GrokBrowserAdapter:
             elif text:
                 stable_count = 0
                 last_text = text
-            if last_text and stable_count >= 2:
+                valid_count = 0
+            if last_text and response_validator:
+                try:
+                    is_valid = bool(response_validator(last_text))
+                except Exception:
+                    is_valid = False
+                valid_count = valid_count + 1 if is_valid else 0
+                if is_valid and stable_count >= required_stable and valid_count > extra_after_valid:
+                    return last_text
+            elif last_text and stable_count >= required_stable:
                 return last_text
             self._sleep(poll)
         return last_text

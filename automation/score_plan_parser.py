@@ -27,7 +27,12 @@ METRIC_KEYS = {
 }
 
 
-def parse_score_plan(raw: str, period: str = "weekly", seed_extra: str = "") -> Dict[str, Any]:
+def parse_score_plan(
+    raw: str,
+    period: str = "weekly",
+    seed_extra: str = "",
+    fallback_config: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     raw = raw or ""
     parsed = parse_markdown_tables(raw)
     if not parsed:
@@ -37,19 +42,43 @@ def parse_score_plan(raw: str, period: str = "weekly", seed_extra: str = "") -> 
         parsed = parse_with_model(raw)
         parser = "model" if parsed else "rules"
     if not parsed:
-        parsed = parse_by_rules(raw, period, seed_extra=seed_extra)
+        parsed = parse_by_rules(raw, period, seed_extra=seed_extra, fallback_config=fallback_config)
         parser = "rules"
     elif not has_actionable_metrics(parsed):
-        parsed = parse_by_rules(raw, period, seed_extra=seed_extra)
+        parsed = parse_by_rules(raw, period, seed_extra=seed_extra, fallback_config=fallback_config)
         parser = "rules"
+    normalized_days = normalize_days(parsed, period, seed_extra=seed_extra, fallback_config=fallback_config)
+    fallback_fill = count_fallback_slots(normalized_days)
+    if fallback_fill["fallback_slots"] and "+fallback" not in parser:
+        parser = f"{parser}+fallback"
     return {
         "type": "score_plan",
         "parser": parser,
         "period": period,
         "score": extract_score(raw),
-        "days": normalize_days(parsed, period, seed_extra=seed_extra),
+        "days": normalized_days,
+        "fallback_fill": fallback_fill,
         "raw_excerpt": raw[:2000],
     }
+
+
+def score_response_complete(raw: str, period: str = "weekly", fallback_config: Dict[str, Any] | None = None) -> bool:
+    parsed = parse_markdown_tables(raw or "")
+    if not parsed:
+        parsed = parse_plain_metric_tables(raw or "")
+    expected_days = 1 if period == "daily" else 30 if period == "monthly" else 7
+    expected_slots = max(1, int((fallback_config or {}).get("slot_count") or RANDOM_SLOT_COUNT))
+    if len(parsed) < expected_days:
+        return False
+    for day in parsed[:expected_days]:
+        slots = day.get("slots") or []
+        if len(slots) < expected_slots:
+            return False
+        for slot in slots[:expected_slots]:
+            metrics = normalize_metrics(slot.get("metrics") or {})
+            if not has_interaction(metrics) and int(metrics.get("posts") or 0) <= 0:
+                return False
+    return True
 
 
 def build_tasks_from_score_plan(plan: Dict[str, Any], max_days: int = 31, fallback_config: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
@@ -314,16 +343,26 @@ def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "", fallback_
     slot_count = max(1, int((fallback_config or {}).get("slot_count") or RANDOM_SLOT_COUNT))
     normalized = []
     seen = set()
+    fallback_by_time = {
+        slot["time"]: slot
+        for slot in parse_by_rules("", "daily", seed_extra=f"fallback|{seed_extra}", fallback_config=fallback_config)[0].get("slots", [])
+    }
     for slot in slots:
         slot_time = normalize_time(slot.get("time"))
         if not slot_time or slot_time in seen:
             continue
         seen.add(slot_time)
+        metrics = normalize_metrics(slot.get("metrics") or slot)
+        needs_fallback = not has_interaction(metrics) and int(metrics.get("posts") or 0) <= 0
+        fallback_slot = fallback_by_time.get(slot_time)
+        if needs_fallback:
+            metrics = dict((fallback_slot or {}).get("metrics") or fallback_metrics(seed_extra, slot_time, fallback_config))
         normalized.append(
             {
                 "time": slot_time,
-                "metrics": normalize_metrics(slot.get("metrics") or slot),
+                "metrics": metrics,
                 "target_urls": extract_urls(json.dumps(slot, ensure_ascii=False)),
+                "fallback_filled": needs_fallback,
             }
         )
     normalized.sort(key=lambda item: item["time"])
@@ -336,14 +375,38 @@ def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "", fallback_
         normalized.append(
             {
                 "time": slot_time,
-                "metrics": {key: 0 for key in METRIC_KEYS},
+                "metrics": dict((fallback_by_time.get(slot_time) or {}).get("metrics") or fallback_metrics(seed_extra, slot_time, fallback_config)),
                 "target_urls": [],
+                "fallback_filled": True,
             }
         )
         if len(normalized) >= slot_count:
             break
     normalized.sort(key=lambda item: item["time"])
     return normalized
+
+
+def fallback_metrics(seed_extra: str, slot_time: str, fallback_config: Dict[str, Any] | None = None) -> Dict[str, int]:
+    day = parse_by_rules("", "daily", seed_extra=f"slot|{seed_extra}|{slot_time}", fallback_config=fallback_config)[0]
+    slots = day.get("slots") or []
+    if not slots:
+        return {key: 0 for key in METRIC_KEYS}
+    return dict(slots[0].get("metrics") or {})
+
+
+def count_fallback_slots(days: List[Dict[str, Any]]) -> Dict[str, int]:
+    total_slots = 0
+    fallback_slots = 0
+    zero_slots = 0
+    for day in days or []:
+        for slot in day.get("slots") or []:
+            total_slots += 1
+            metrics = normalize_metrics(slot.get("metrics") or {})
+            if slot.get("fallback_filled"):
+                fallback_slots += 1
+            if not has_interaction(metrics) and int(metrics.get("posts") or 0) <= 0:
+                zero_slots += 1
+    return {"total_slots": total_slots, "fallback_slots": fallback_slots, "zero_slots": zero_slots}
 
 
 def seed_int(*parts: Any) -> int:

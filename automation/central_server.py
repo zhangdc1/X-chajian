@@ -254,7 +254,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if not node_id:
                 write_json(self, 400, {"ok": False, "error": "missing node_id"})
                 return
-            job = self.storage.lease_next_job(node_id)
+            include_job_types = [item.strip() for item in query.get("include_job_type", []) if item.strip()]
+            exclude_job_types = [item.strip() for item in query.get("exclude_job_type", []) if item.strip()]
+            job = self.storage.lease_next_job(
+                node_id,
+                include_job_types=include_job_types or None,
+                exclude_job_types=exclude_job_types or None,
+            )
             write_json(self, 200, {"ok": True, "job": job})
             return
         if parsed.path == "/worker/config":
@@ -796,6 +802,17 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if path == "/admin/api/score-fallback-config":
                 write_json(self, 200, {"ok": True, "config": self.storage.get_score_fallback_config()})
                 return
+            if path == "/admin/api/score-concurrency-config":
+                default_worker = self.storage.get_worker_default_config(mask_secrets=True)
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "score_plan_concurrency_per_node": int(default_worker.get("score_plan_concurrency_per_node") or 1),
+                    },
+                )
+                return
             if path == "/admin/api/search-keywords":
                 keywords = self.storage.get_search_keywords()
                 write_json(
@@ -960,6 +977,16 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 config = self.storage.update_score_fallback_config(payload)
                 self._audit(user, "update_score_fallback_config", "setting", "score_fallback_config", {"keys": sorted(payload.keys())})
                 write_json(self, 200, {"ok": True, "config": config})
+                return
+            if path == "/admin/api/score-concurrency-config":
+                try:
+                    value = max(1, min(8, int(payload.get("score_plan_concurrency_per_node") or 1)))
+                except (TypeError, ValueError):
+                    write_json(self, 400, {"ok": False, "error": "invalid concurrency"})
+                    return
+                config = self.storage.update_worker_default_config({"score_plan_concurrency_per_node": value})
+                self._audit(user, "update_score_concurrency", "setting", "worker_default_config", {"score_plan_concurrency_per_node": value})
+                write_json(self, 200, {"ok": True, "score_plan_concurrency_per_node": value, "config": config})
                 return
             if path.startswith("/admin/api/score-plans/"):
                 parts = path.strip("/").split("/")

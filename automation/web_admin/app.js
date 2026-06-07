@@ -496,7 +496,7 @@ async function loadPlans() {
   const query = new URLSearchParams();
   if ($("planGroup").value.trim()) query.set("group_id", $("planGroup").value.trim());
   query.set("limit", "300");
-  const [plans] = await Promise.all([api(`/admin/api/score-plans?${query.toString()}`), loadPrompt(), loadFallbackConfig()]);
+  const [plans] = await Promise.all([api(`/admin/api/score-plans?${query.toString()}`), loadPrompt(), loadFallbackConfig(), loadScoreConcurrencyConfig()]);
   $("plansTable").innerHTML = table([th("ID"), th("账号"), th("分组"), th("评分"), th("状态"), th("来源 job"), th("调度汇总"), th("创建"), th("操作")], plans.plans.map(p => `
     <tr>
       <td>${p.id}</td>
@@ -528,6 +528,11 @@ async function loadPrompt() {
 async function loadFallbackConfig() {
   const data = await api("/admin/api/score-fallback-config");
   $("fallbackConfigBox").innerHTML = renderFallbackConfig(data.config || {});
+}
+
+async function loadScoreConcurrencyConfig() {
+  const data = await api("/admin/api/score-concurrency-config");
+  if ($("scoreConcurrency")) $("scoreConcurrency").value = data.score_plan_concurrency_per_node || 1;
 }
 
 function renderFallbackConfig(cfg) {
@@ -690,6 +695,7 @@ async function planDetail(planId) {
   const plan = data.plan || {};
   const tasks = data.tasks || [];
   const days = ((plan.parsed_plan || {}).days || []);
+  const fallbackFill = (plan.parsed_plan || {}).fallback_fill || {};
   const planRows = [];
   for (const day of days) {
     for (const slot of (day.slots || [])) {
@@ -713,6 +719,7 @@ async function planDetail(planId) {
   showHtmlDetail(`评分计划 ${planId}`, `
     <div class="detail-section">
       <p><b>账号：</b>${esc(plan.account_display || plan.account_id || "-")}　<b>状态：</b>${statusPill(plan.status)}　<b>调度：</b>${esc(summaryText(plan.task_summary || {}))}</p>
+      <p><b>解析：</b>${esc((plan.parsed_plan || {}).parser || "-")}　<b>时间点：</b>${esc(fallbackFill.total_slots ?? "-")}　<b>兜底补齐：</b>${esc(fallbackFill.fallback_slots ?? 0)}　<b>全0剩余：</b>${esc(fallbackFill.zero_slots ?? 0)}</p>
       ${table([th("天"), th("日期"), th("时间"), ...metricLabels.map(([, label]) => th(label))], planRows, "没有解析到计划表格")}
     </div>
     <div class="detail-section">
@@ -795,6 +802,16 @@ async function saveFallbackConfig() {
   await api("/admin/api/score-fallback-config", { method: "POST", body: JSON.stringify(payload) });
   alert("兜底计划配置已保存");
   await loadFallbackConfig();
+}
+
+async function saveScoreConcurrencyConfig() {
+  const value = Number($("scoreConcurrency").value || 1);
+  await api("/admin/api/score-concurrency-config", {
+    method: "POST",
+    body: JSON.stringify({ score_plan_concurrency_per_node: value }),
+  });
+  alert("评分并发数已保存，Worker 下一轮配置刷新后生效");
+  await loadScoreConcurrencyConfig();
 }
 
 async function saveModelConfig() {
@@ -942,6 +959,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("savePromptBtn").addEventListener("click", savePrompt);
   $("resetPromptBtn").addEventListener("click", resetPrompt);
   $("saveFallbackBtn").addEventListener("click", saveFallbackConfig);
+  $("saveScoreConcurrencyBtn").addEventListener("click", saveScoreConcurrencyConfig);
   $("saveModelBtn").addEventListener("click", saveModelConfig);
   document.addEventListener("click", event => {
     if (event.target && event.target.id === "testModelBtn") {

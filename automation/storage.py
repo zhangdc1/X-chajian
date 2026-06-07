@@ -553,6 +553,7 @@ class Storage:
             "sync_profiles_interval_seconds": 30,
             "worker_config_interval_seconds": 30,
             "stale_job_grace_seconds": 3600,
+            "score_plan_concurrency_per_node": 1,
             "model_config": dict(DEFAULT_MODEL_CONFIG),
             "search_keywords": [],
         }
@@ -751,6 +752,7 @@ class Storage:
         cfg.setdefault("label", node_id)
         cfg["sync_group_ids"] = [str(row["group_id"]) for row in sync_rows]
         cfg["search_keywords"] = self.get_search_keywords()
+        cfg["score_fallback_config"] = self.get_score_fallback_config()
         cfg["model_config"] = self._merge_model_config(DEFAULT_MODEL_CONFIG, dict(cfg.get("model_config") or {}))
         cfg["config_version"] = int(
             max(
@@ -777,6 +779,7 @@ class Storage:
             "sync_profiles_interval_seconds",
             "worker_config_interval_seconds",
             "stale_job_grace_seconds",
+            "score_plan_concurrency_per_node",
             "model_config",
         }
         with self.connect() as conn:
@@ -812,6 +815,7 @@ class Storage:
             "sync_profiles_interval_seconds",
             "worker_config_interval_seconds",
             "stale_job_grace_seconds",
+            "score_plan_concurrency_per_node",
             "model_config",
         }
         with self.connect() as conn:
@@ -1442,7 +1446,13 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def lease_next_job(self, node_id: str, lease_seconds: int = 300) -> Optional[Dict[str, Any]]:
+    def lease_next_job(
+        self,
+        node_id: str,
+        lease_seconds: int = 300,
+        include_job_types: Optional[list[str]] = None,
+        exclude_job_types: Optional[list[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         ts = now_ts()
         lease_until = ts + lease_seconds
         cutoff = ts - 3600
@@ -1450,15 +1460,26 @@ class Storage:
             conn.execute("BEGIN IMMEDIATE")
             row = None
             while True:
+                filters = ""
+                params: list[Any] = [node_id]
+                if include_job_types:
+                    placeholders = ",".join("?" for _ in include_job_types)
+                    filters += f" AND job_type IN ({placeholders})"
+                    params.extend(include_job_types)
+                if exclude_job_types:
+                    placeholders = ",".join("?" for _ in exclude_job_types)
+                    filters += f" AND job_type NOT IN ({placeholders})"
+                    params.extend(exclude_job_types)
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM jobs
                     WHERE status = 'queued'
                       AND (target_node_id IS NULL OR target_node_id = ?)
+                      {filters}
                     ORDER BY priority DESC, id ASC
                     LIMIT 1
                     """,
-                    (node_id,),
+                    params,
                 ).fetchone()
                 if row is None:
                     break

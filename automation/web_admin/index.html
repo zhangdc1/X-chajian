@@ -160,6 +160,12 @@
         </div>
         <div class="panel">
           <div class="panel-head"><h2>兜底计划配置</h2></div>
+          <div class="inline-form">
+            <label for="scoreConcurrency">每台电脑评分并发数</label>
+            <input id="scoreConcurrency" type="number" min="1" max="8" step="1" value="1">
+            <button id="saveScoreConcurrencyBtn">保存并发数</button>
+          </div>
+          <p class="muted">数值越大越快，但会同时打开更多比特浏览器窗口和 Grok 页面。</p>
           <div id="fallbackConfigBox"></div>
           <div class="row-actions">
             <button id="saveFallbackBtn">保存兜底配置</button>

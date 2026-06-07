@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -7,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib import request
+from urllib import parse, request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,7 +29,7 @@ from automation.job_types import (
 from automation.bit_browser import BitBrowserClient
 from automation.grok_adapter import GrokBrowserAdapter
 from automation.license_guard import LicenseGuard
-from automation.score_plan_parser import parse_score_plan
+from automation.score_plan_parser import parse_score_plan, score_response_complete
 from automation.task_audit import TaskAudit
 
 
@@ -58,6 +59,7 @@ DEFAULT_WORKER_CONFIG = {
     "sync_profiles_interval_seconds": 30,
     "worker_config_interval_seconds": 30,
     "stale_job_grace_seconds": 3600,
+    "score_plan_concurrency_per_node": 1,
 }
 
 
@@ -155,6 +157,15 @@ class Worker:
         self._last_worker_error = ""
         self._legacy_config_mtime = 0.0
         self._job_opened_profiles: Dict[int, Dict[str, str]] = {}
+        self._job_log_paths: Dict[int, Path] = {}
+        self._score_jobs_lock = threading.RLock()
+        self._score_jobs: Dict[int, Dict[str, Any]] = {}
+        self._score_futures: Dict[concurrent.futures.Future, int] = {}
+        self._score_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(8, int(config.get("score_plan_concurrency_per_node", 1) or 1))),
+            thread_name_prefix="xbot-score",
+        )
+        self._score_executor_workers = max(1, min(8, int(config.get("score_plan_concurrency_per_node", 1) or 1)))
         self.audit = TaskAudit(
             config.get("task_dir", "automation/tasks"),
             config.get("log_dir", "automation/logs"),
@@ -226,7 +237,9 @@ class Worker:
                 self.refresh_assigned_sync_groups()
                 self.sync_profiles()
                 last_profile_sync = now
-            job = self.next_job()
+            self.collect_score_futures()
+            self.fill_score_slots()
+            job = self.next_job(exclude_job_types=[JOB_SCORE_GROK_PLAN])
             if job:
                 try:
                     self.handle_job(job)
@@ -241,6 +254,61 @@ class Worker:
                         print(f"failed to report unexpected job error: {report_exc}")
             else:
                 time.sleep(poll)
+
+    def score_concurrency_limit(self) -> int:
+        try:
+            return max(1, min(8, int(self.config.get("score_plan_concurrency_per_node", 1) or 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    def ensure_score_executor(self) -> None:
+        limit = self.score_concurrency_limit()
+        if limit == self._score_executor_workers:
+            return
+        old_executor = self._score_executor
+        self._score_executor = concurrent.futures.ThreadPoolExecutor(max_workers=limit, thread_name_prefix="xbot-score")
+        self._score_executor_workers = limit
+        old_executor.shutdown(wait=False, cancel_futures=False)
+
+    def running_score_job_count(self) -> int:
+        with self._score_jobs_lock:
+            return len(self._score_futures)
+
+    def current_score_jobs(self) -> list[Dict[str, Any]]:
+        with self._score_jobs_lock:
+            return list(self._score_jobs.values())
+
+    def collect_score_futures(self) -> None:
+        done_items: list[tuple[concurrent.futures.Future, int]] = []
+        with self._score_jobs_lock:
+            for future, job_id in list(self._score_futures.items()):
+                if future.done():
+                    done_items.append((future, job_id))
+                    self._score_futures.pop(future, None)
+                    self._score_jobs.pop(job_id, None)
+        for future, job_id in done_items:
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"score job worker future failed for job {job_id}: {exc}")
+
+    def fill_score_slots(self) -> None:
+        self.collect_score_futures()
+        while self.running_score_job_count() < self.score_concurrency_limit():
+            job = self.next_job(include_job_types=[JOB_SCORE_GROK_PLAN])
+            if not job:
+                return
+            payload = job.get("payload") or {}
+            job_id = int(job.get("id") or 0)
+            with self._score_jobs_lock:
+                self._score_jobs[job_id] = {
+                    "id": job_id,
+                    "job_type": job.get("job_type"),
+                    "account_id": payload.get("account_id") or payload.get("profile_id"),
+                    "started_at": int(time.time()),
+                }
+                future = self._score_executor.submit(self.handle_job, job)
+                self._score_futures[future] = job_id
 
     def start_heartbeat_thread(self) -> None:
         if self._heartbeat_started:
@@ -271,6 +339,9 @@ class Worker:
                 "client_version": self.config.get("app_version", "unknown"),
                 "config_version": self.config.get("config_version"),
                 "current_job": self.current_job,
+                "score_plan_concurrency_per_node": self.score_concurrency_limit(),
+                "score_jobs_running": self.running_score_job_count(),
+                "score_jobs": self.current_score_jobs(),
                 "last_config_refresh_at": self._last_config_refresh_ts,
                 "last_profile_sync_at": self._last_profile_sync_ts,
                 "last_worker_error": self._last_worker_error,
@@ -300,11 +371,13 @@ class Worker:
             "sync_profiles_interval_seconds",
             "worker_config_interval_seconds",
             "stale_job_grace_seconds",
+            "score_plan_concurrency_per_node",
             "config_version",
         ):
             if key in central_config and self.config.get(key) != central_config.get(key):
                 self.config[key] = central_config.get(key)
                 changed = True
+        self.ensure_score_executor()
         if central_config.get("central_api") and self.config.get("central_api") != central_config.get("central_api"):
             self.config["central_api"] = str(central_config.get("central_api")).rstrip("/")
             self.central_api = self.config["central_api"]
@@ -329,6 +402,8 @@ class Worker:
         model_config = central_config.get("model_config")
         if isinstance(model_config, dict):
             self.write_model_config(model_config)
+        if isinstance(central_config.get("score_fallback_config"), dict):
+            self.config["score_fallback_config"] = central_config.get("score_fallback_config")
         if changed and save_local:
             try:
                 save_config(self.config_path, self.config)
@@ -495,8 +570,19 @@ class Worker:
             self.config["local_farming_config"] = loaded.get("FARMING_CONFIG") or {}
         print("reloaded local config.yaml changes")
 
-    def next_job(self) -> Optional[Dict[str, Any]]:
+    def next_job(
+        self,
+        include_job_types: Optional[list[str]] = None,
+        exclude_job_types: Optional[list[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         url = f"{self.central_api}/worker/next?node_id={self.node_id}"
+        query_parts = []
+        for item in include_job_types or []:
+            query_parts.append(f"include_job_type={parse.quote(str(item))}")
+        for item in exclude_job_types or []:
+            query_parts.append(f"exclude_job_type={parse.quote(str(item))}")
+        if query_parts:
+            url += "&" + "&".join(query_parts)
         try:
             response = api_json("GET", url, self.token)
             return response.get("job")
@@ -527,17 +613,23 @@ class Worker:
             raise RuntimeError("中央评分提示词为空，请先在 GUI 的账号评分计划页保存提示词")
         return prompt
 
+    def fetch_score_fallback_config(self) -> Dict[str, Any]:
+        config = self.config.get("score_fallback_config") or {}
+        return config if isinstance(config, dict) else {}
+
     def handle_job(self, job: Dict[str, Any]) -> None:
         payload = job.setdefault("payload", {})
         job_id_int = int(job["id"])
         self._job_opened_profiles[job_id_int] = {}
-        self.current_job = {
-            "id": job.get("id"),
-            "job_type": job.get("job_type"),
-            "mode": payload.get("mode"),
-            "account_id": payload.get("account_id") or payload.get("profile_id"),
-            "started_at": int(time.time()),
-        }
+        is_score_job = job.get("job_type") == JOB_SCORE_GROK_PLAN
+        if not is_score_job:
+            self.current_job = {
+                "id": job.get("id"),
+                "job_type": job.get("job_type"),
+                "mode": payload.get("mode"),
+                "account_id": payload.get("account_id") or payload.get("profile_id"),
+                "started_at": int(time.time()),
+            }
         if job.get("status") in {"cancelled", "cancel_requested"} or self.is_job_cancelled(int(job["id"])):
             self.fail(job["id"], "任务已取消，未执行")
             return
@@ -545,6 +637,7 @@ class Worker:
         log_path = self.audit.log_path_for(job)
         payload["_local_log_path"] = str(log_path)
         self._current_log_path = log_path
+        self._job_log_paths[job_id_int] = log_path
         self.audit.start_job(job, log_path)
         mode = payload.get("mode") or "-"
         self.log_job(
@@ -595,9 +688,11 @@ class Worker:
             if not profiles_closed:
                 self.close_job_profiles(job)
             self._job_opened_profiles.pop(job_id_int, None)
+            self._job_log_paths.pop(job_id_int, None)
             self.lock.release(lock_path)
             self._current_log_path = None
-            self.current_job = {}
+            if not is_score_job:
+                self.current_job = {}
 
     def execute(self, job: Dict[str, Any]) -> Dict[str, Any]:
         job_type = job["job_type"]
@@ -679,10 +774,20 @@ class Worker:
             debug_port = self._extract_debug_port(opened)
             if not debug_port:
                 raise RuntimeError(f"Bit Browser did not return a debug port: {opened}")
-            result = self.grok.ask_with_debug_port(debug_port, prompt)
+            fallback_config = self.fetch_score_fallback_config()
+            result = self.grok.ask_with_debug_port(
+                debug_port,
+                prompt,
+                response_validator=lambda text: score_response_complete(text, period=period, fallback_config=fallback_config),
+            )
             if not result.ok:
                 raise RuntimeError(result.error)
-            parsed = parse_score_plan(result.raw_response, period=period, seed_extra=str(profile_id or account_id))
+            parsed = parse_score_plan(
+                result.raw_response,
+                period=period,
+                seed_extra=str(profile_id or account_id),
+                fallback_config=fallback_config,
+            )
             return {
                 "status": "score_plan_collected",
                 "account_id": account_id,
@@ -699,7 +804,7 @@ class Worker:
             "profile_id": profile_id,
             "period": period,
             "prompt": prompt,
-            "parsed_plan": parse_score_plan("", period=period, seed_extra=str(profile_id or account_id)),
+            "parsed_plan": parse_score_plan("", period=period, seed_extra=str(profile_id or account_id), fallback_config=self.fetch_score_fallback_config()),
         }
 
     def open_bit_profile(self, profile_id: Any, job_id: int = 0) -> Dict[str, Any]:
@@ -1175,7 +1280,7 @@ class Worker:
     def log_job(self, job_id: int, status: str, message: str) -> None:
         if not job_id:
             return
-        self.audit.append_log(self._current_log_path, status, message)
+        self.audit.append_log(self._job_log_paths.get(int(job_id)) or self._current_log_path, status, message)
         try:
             api_json(
                 "POST",
