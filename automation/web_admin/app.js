@@ -251,12 +251,12 @@ function renderJobsMini(jobs) {
 async function loadWorkers() {
   const data = await api("/admin/api/workers?limit=200");
   $("workersTable").innerHTML = table([
-    th("电脑"), th("标签"), th("在线"), th("Grok"), th("中央同步分组"), th("运行上报分组"), th("账号来源分组"), th("一致性"), th("当前任务"), th("最后心跳"), th("操作"),
+    th("电脑"), th("标签"), th("在线"), th("Grok"), th("当前同步分组"), th("中央配置分组"), th("账号来源分组"), th("一致性"), th("当前任务"), th("最后心跳"), th("操作"),
   ], data.workers.map(w => {
     const cfg = w.central_config || {};
     const current = (w.meta || {}).current_job || {};
     const central = w.central_sync_group_ids || cfg.sync_group_ids || [];
-    const runtime = w.runtime_sync_group_ids || [];
+    const runtime = w.current_sync_group_ids || w.runtime_sync_group_ids || [];
     const accounts = w.account_group_ids || [];
     const mismatch = w.sync_mismatch || w.account_mismatch;
     return `<tr>
@@ -264,14 +264,15 @@ async function loadWorkers() {
       <td>${esc(w.label)}</td>
       <td>${w.online ? statusPill("online") : statusPill("offline")}</td>
       <td>${cfg.enable_grok_browser ? statusPill("active") : statusPill("inactive")}</td>
-      <td class="wrap">${esc(central.join(", ") || "-")}</td>
       <td class="wrap">${esc(runtime.join(", ") || "-")}</td>
+      <td class="wrap">${esc(central.join(", ") || "-")}</td>
       <td class="wrap">${esc(accounts.join(", ") || "-")}</td>
-      <td>${mismatch ? '<span class="pill warn">配置不一致</span>' : '<span class="pill ok">一致</span>'}</td>
+      <td>${mismatch ? '<span class="pill warn">待同步/不一致</span>' : '<span class="pill ok">一致</span>'}</td>
       <td class="wrap">${current.id ? `job=${esc(current.id)} ${esc(current.job_type || "")}` : "-"}</td>
       <td>${fmtTime(w.last_seen)}<div class="small muted">${w.offline_seconds || 0} 秒前</div></td>
       <td>
         <button class="ghost" onclick="editWorkerConfig('${esc(w.node_id)}')">配置</button>
+        ${runtime.length ? `<button class="ghost" onclick='useCurrentWorkerGroups("${esc(w.node_id)}", ${JSON.stringify(runtime).replaceAll("'", "&#39;")})'>当前覆盖中央</button>` : ""}
         <button class="ghost" onclick='showDetail("电脑详情", ${JSON.stringify(w).replaceAll("'", "&#39;")})'>详情</button>
       </td>
     </tr>`;
@@ -280,7 +281,7 @@ async function loadWorkers() {
 
 async function loadGroups() {
   const data = await api("/admin/api/groups?limit=300");
-  $("groupsTable").innerHTML = table([th("别名"), th("group_id"), th("启用账号"), th("停用账号"), th("来源电脑"), th("同步电脑"), th("历史别名"), th("操作")], data.groups.map(g => `
+  $("groupsTable").innerHTML = table([th("别名"), th("group_id"), th("启用账号"), th("停用账号"), th("来源电脑"), th("当前同步电脑"), th("中央配置电脑"), th("历史别名"), th("操作")], data.groups.map(g => `
     <tr>
       <td>${esc(g.alias || "-")}</td>
       <td>${esc(g.group_id)}</td>
@@ -288,6 +289,7 @@ async function loadGroups() {
       <td>${g.inactive_count || 0}</td>
       <td class="wrap">${esc(g.node_ids || "-")}</td>
       <td class="wrap">${esc(g.sync_node_ids || "-")}</td>
+      <td class="wrap">${esc(g.central_sync_node_ids || "-")}</td>
       <td>${g.alias_history_count || 0}</td>
       <td>
         ${g.alias ? `<button class="ghost danger" onclick="deleteAlias('${esc(g.alias)}')">解绑</button>` : ""}
@@ -676,6 +678,17 @@ async function editWorkerConfig(nodeId) {
   await loadWorkers();
 }
 
+async function useCurrentWorkerGroups(nodeId, groupIds) {
+  const groups = Array.isArray(groupIds) ? groupIds : [];
+  if (!groups.length) return alert("当前没有可覆盖的运行分组");
+  if (!confirm(`确认用 ${nodeId} 当前运行分组覆盖中央配置？\n${groups.join(", ")}`)) return;
+  await api(`/admin/api/workers/${encodeURIComponent(nodeId)}/sync-groups`, {
+    method: "POST",
+    body: JSON.stringify({ sync_group_ids: groups }),
+  });
+  await loadWorkers();
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   $("loginForm").addEventListener("submit", login);
   $("logoutBtn").addEventListener("click", logout);
@@ -714,3 +727,4 @@ window.taskAction = taskAction;
 window.toggleJob = toggleJob;
 window.toggleAll = toggleAll;
 window.editWorkerConfig = editWorkerConfig;
+window.useCurrentWorkerGroups = useCurrentWorkerGroups;

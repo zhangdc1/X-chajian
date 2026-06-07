@@ -1082,6 +1082,7 @@ class Storage:
         return identifier
 
     def list_groups(self, limit: int = 100) -> list[Dict[str, Any]]:
+        online_cutoff = now_ts() - 90
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -1123,57 +1124,53 @@ class Storage:
                     FROM worker_sync_groups
                     WHERE status = 'active'
                     GROUP BY group_id
+                ),
+                current_sync_groups AS (
+                    SELECT
+                        json_each.value AS group_id,
+                        GROUP_CONCAT(DISTINCT worker_nodes.node_id) AS current_sync_node_ids,
+                        MAX(worker_nodes.last_seen) AS current_sync_updated_at
+                    FROM worker_nodes, json_each(worker_nodes.meta_json, '$.sync_group_ids')
+                    WHERE worker_nodes.status = 'online'
+                      AND worker_nodes.last_seen >= ?
+                      AND COALESCE(json_each.value, '') <> ''
+                    GROUP BY json_each.value
+                ),
+                all_groups AS (
+                    SELECT group_id FROM account_groups
+                    UNION
+                    SELECT group_id FROM alias_groups
+                    UNION
+                    SELECT group_id FROM sync_groups
+                    UNION
+                    SELECT group_id FROM current_sync_groups
                 )
                 SELECT
-                    COALESCE(ag.group_id, sg.group_id) AS group_id,
+                    all_groups.group_id AS group_id,
                     COALESCE(alg.alias, '') AS alias,
                     COALESCE(ag.account_count, 0) AS account_count,
                     COALESCE(ag.inactive_count, 0) AS inactive_count,
                     COALESCE(ag.node_ids, '') AS node_ids,
                     COALESCE(ag.last_seen, 0) AS last_seen,
-                    COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
+                    COALESCE(csg.current_sync_node_ids, '') AS sync_node_ids,
+                    COALESCE(sg.sync_node_ids, '') AS central_sync_node_ids,
                     COALESCE(ah.alias_history_count, 0) AS alias_history_count,
-                    MAX(COALESCE(ag.updated_at, 0), COALESCE(alg.updated_at, 0), COALESCE(sg.sync_updated_at, 0)) AS updated_at
-                FROM account_groups ag
-                LEFT JOIN alias_groups alg ON alg.group_id = ag.group_id
-                LEFT JOIN alias_history ah ON ah.group_id = ag.group_id
-                LEFT JOIN sync_groups sg ON sg.group_id = ag.group_id
-                UNION ALL
-                SELECT
-                    alg.group_id AS group_id,
-                    COALESCE(alg.alias, '') AS alias,
-                    0 AS account_count,
-                    0 AS inactive_count,
-                    '' AS node_ids,
-                    0 AS last_seen,
-                    COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
-                    COALESCE(ah.alias_history_count, 0) AS alias_history_count,
-                    MAX(COALESCE(alg.updated_at, 0), COALESCE(sg.sync_updated_at, 0)) AS updated_at
-                FROM alias_groups alg
-                LEFT JOIN account_groups ag ON ag.group_id = alg.group_id
-                LEFT JOIN alias_history ah ON ah.group_id = alg.group_id
-                LEFT JOIN sync_groups sg ON sg.group_id = alg.group_id
-                WHERE ag.group_id IS NULL
-                UNION ALL
-                SELECT
-                    sg.group_id AS group_id,
-                    '' AS alias,
-                    0 AS account_count,
-                    0 AS inactive_count,
-                    '' AS node_ids,
-                    0 AS last_seen,
-                    COALESCE(sg.sync_node_ids, '') AS sync_node_ids,
-                    COALESCE(ah.alias_history_count, 0) AS alias_history_count,
-                    sg.sync_updated_at AS updated_at
-                FROM sync_groups sg
-                LEFT JOIN account_groups ag ON ag.group_id = sg.group_id
-                LEFT JOIN alias_groups alg ON alg.group_id = sg.group_id
-                LEFT JOIN alias_history ah ON ah.group_id = sg.group_id
-                WHERE ag.group_id IS NULL AND alg.group_id IS NULL
+                    MAX(
+                        COALESCE(ag.updated_at, 0),
+                        COALESCE(alg.updated_at, 0),
+                        COALESCE(csg.current_sync_updated_at, 0),
+                        COALESCE(sg.sync_updated_at, 0)
+                    ) AS updated_at
+                FROM all_groups
+                LEFT JOIN account_groups ag ON ag.group_id = all_groups.group_id
+                LEFT JOIN alias_groups alg ON alg.group_id = all_groups.group_id
+                LEFT JOIN alias_history ah ON ah.group_id = all_groups.group_id
+                LEFT JOIN sync_groups sg ON sg.group_id = all_groups.group_id
+                LEFT JOIN current_sync_groups csg ON csg.group_id = all_groups.group_id
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (online_cutoff, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1818,10 +1815,12 @@ class Storage:
             runtime_groups = [str(x) for x in runtime_groups if str(x)]
             account_groups = account_groups_by_node.get(str(item.get("node_id") or ""), [])
             item["central_sync_group_ids"] = central_groups
+            item["current_sync_group_ids"] = runtime_groups if item["online"] else []
+            item["last_reported_sync_group_ids"] = runtime_groups
             item["runtime_sync_group_ids"] = runtime_groups
             item["account_group_ids"] = account_groups
-            item["sync_mismatch"] = sorted(central_groups) != sorted(runtime_groups) if runtime_groups else False
-            item["account_mismatch"] = bool(account_groups and sorted(account_groups) != sorted(central_groups))
+            item["sync_mismatch"] = item["online"] and sorted(central_groups) != sorted(runtime_groups) if runtime_groups else False
+            item["account_mismatch"] = bool(item["online"] and account_groups and runtime_groups and sorted(account_groups) != sorted(runtime_groups))
             result.append(item)
         return result
 

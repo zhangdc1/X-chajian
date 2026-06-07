@@ -350,25 +350,10 @@ class Worker:
             print(f"profile sync upload failed: {exc}")
 
     def refresh_assigned_sync_groups(self) -> None:
-        try:
-            response = api_json("GET", f"{self.central_api}/worker-sync-groups?node_id={self.node_id}", self.token)
-        except Exception as exc:
-            print(f"worker sync group refresh failed: {exc}")
-            return
-        assigned = [str(item.get("group_id") or "").strip() for item in response.get("groups", [])]
-        assigned = [item for item in assigned if item]
-        if not assigned:
-            return
-        existing = [str(item).strip() for item in (self.config.get("sync_group_ids") or []) if str(item).strip()]
-        merged = list(dict.fromkeys([*existing, *assigned]))
-        if merged == existing:
-            return
-        self.config["sync_group_ids"] = merged
-        try:
-            save_config(self.config_path, self.config)
-            print(f"updated local sync_group_ids from central: {','.join(assigned)}")
-        except Exception as exc:
-            print(f"save sync_group_ids failed: {exc}")
+        # Central config is authoritative and is applied by apply_central_config().
+        # Do not append historical worker_sync_groups here, otherwise old groups
+        # can leak back into the local runtime after the user has changed them.
+        self.apply_central_config(save_local=True)
 
     def next_job(self) -> Optional[Dict[str, Any]]:
         url = f"{self.central_api}/worker/next?node_id={self.node_id}"

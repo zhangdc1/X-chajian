@@ -12,12 +12,7 @@ class GrokResult:
 
 
 class GrokBrowserAdapter:
-    """Browser adapter for X built-in Grok.
-
-    The selectors are configurable because X changes its DOM frequently. This
-    adapter is deliberately narrow: it submits a prompt and extracts text. The
-    worker decides whether to call it.
-    """
+    """Browser adapter for X built-in Grok."""
 
     def __init__(self, settings: Dict[str, Any]):
         self.settings = settings
@@ -42,6 +37,7 @@ class GrokBrowserAdapter:
             input_ele = self._first_ele(page, self.settings.get("input_selectors", []), timeout=8)
             if not input_ele:
                 return GrokResult(False, "", "Grok input element not found")
+
             ok, entered_len = self._fill_prompt(page, input_ele, prompt)
             if not ok:
                 return GrokResult(
@@ -50,11 +46,8 @@ class GrokBrowserAdapter:
                     f"提示词未完整输入：输入长度 {entered_len}/{len(prompt)}，已停止发送，避免生成错误计划",
                 )
 
-            send_ele = self._first_ele(page, self.settings.get("send_selectors", []), timeout=3)
-            if send_ele:
-                send_ele.click(by_js=True)
-            else:
-                page.actions.type("\n")
+            if not self._send_prompt(page, input_ele):
+                return GrokResult(False, "", "Grok 提示词已输入但发送按钮未激活，已停止，避免生成错误计划")
 
             raw = self._wait_for_response(page)
             if not raw:
@@ -73,25 +66,22 @@ class GrokBrowserAdapter:
             except Exception:
                 pass
             self._sleep(0.2)
-            if self._try_js_set(page, input_ele, prompt):
-                self._sleep(0.4)
+
+            # Prefer real user-like input. Some Grok pages show JS-set text but
+            # keep the send button disabled because React did not receive input.
+            for writer in (
+                lambda: self._try_clipboard_paste(page, prompt),
+                lambda: self._try_direct_input(page, input_ele, prompt),
+                lambda: self._try_js_set(page, input_ele, prompt),
+            ):
+                if not writer():
+                    continue
+                self._sleep(0.6)
                 length = self._input_text_length(page, input_ele)
                 if self._enough_text(length, prompt):
+                    self._nudge_input(page, input_ele)
                     return True, length
-            if self._try_clipboard_paste(page, prompt):
-                self._sleep(0.5)
-                length = self._input_text_length(page, input_ele)
-                if self._enough_text(length, prompt):
-                    return True, length
-            try:
-                input_ele.click()
-                page.actions.type(prompt)
-            except Exception:
-                pass
-            self._sleep(0.5)
-            length = self._input_text_length(page, input_ele)
-            if self._enough_text(length, prompt):
-                return True, length
+
             if attempt == 0:
                 self._clear_input(page, input_ele)
         return False, self._input_text_length(page, input_ele)
@@ -101,6 +91,20 @@ class GrokBrowserAdapter:
         expected = len(prompt or "")
         return expected <= 20 or length >= int(expected * 0.9)
 
+    def _try_direct_input(self, page: Any, input_ele: Any, prompt: str) -> bool:
+        try:
+            input_ele.click()
+            input_ele.input(prompt, clear=True)
+            return True
+        except Exception:
+            pass
+        try:
+            input_ele.click()
+            page.actions.type(prompt)
+            return True
+        except Exception:
+            return False
+
     def _try_js_set(self, page: Any, input_ele: Any, prompt: str) -> bool:
         escaped = self._js_string(prompt)
         scripts = [
@@ -108,8 +112,13 @@ class GrokBrowserAdapter:
             const el = document.activeElement;
             const value = __PROMPT__;
             if (!el) return false;
+            el.focus();
             if ('value' in el) el.value = value;
-            else el.textContent = value;
+            else {
+              el.textContent = value;
+              el.innerText = value;
+            }
+            el.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, inputType:'insertText', data:value}));
             el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:value}));
             el.dispatchEvent(new Event('change', {bubbles:true}));
             return true;
@@ -121,7 +130,11 @@ class GrokBrowserAdapter:
             if (!el) return false;
             el.focus();
             if ('value' in el) el.value = value;
-            else el.textContent = value;
+            else {
+              el.textContent = value;
+              el.innerText = value;
+            }
+            el.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, inputType:'insertText', data:value}));
             el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:value}));
             el.dispatchEvent(new Event('change', {bubbles:true}));
             return true;
@@ -133,11 +146,7 @@ class GrokBrowserAdapter:
                     return True
             except Exception:
                 continue
-        try:
-            input_ele.input(prompt, clear=True)
-            return True
-        except Exception:
-            return False
+        return False
 
     def _try_clipboard_paste(self, page: Any, prompt: str) -> bool:
         try:
@@ -177,6 +186,155 @@ class GrokBrowserAdapter:
             check=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    def _nudge_input(self, page: Any, input_ele: Any) -> None:
+        try:
+            input_ele.click()
+            page.actions.type(" ").type("\b")
+        except Exception:
+            pass
+        try:
+            page.run_js(
+                """
+                const el = document.activeElement || document.querySelector('textarea,[contenteditable="true"],[role="textbox"]');
+                if (!el) return;
+                el.dispatchEvent(new KeyboardEvent('keydown', {key:' ', bubbles:true}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {key:' ', bubbles:true}));
+                el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:' '}));
+                """
+            )
+        except Exception:
+            pass
+
+    def _send_prompt(self, page: Any, input_ele: Any) -> bool:
+        for _ in range(2):
+            self._sleep(float(self.settings.get("send_ready_wait_seconds", 1)))
+            send_ele = self._find_send_button(page)
+            if send_ele:
+                for by_js in (False, True):
+                    try:
+                        send_ele.click(by_js=by_js)
+                        self._sleep(1.2)
+                        if self._looks_submitted(page):
+                            return True
+                    except Exception:
+                        continue
+            if self._click_send_button_by_js(page):
+                self._sleep(1.2)
+                if self._looks_submitted(page):
+                    return True
+            for action in ("enter", "ctrl_enter"):
+                try:
+                    input_ele.click()
+                    if action == "enter":
+                        page.actions.type("\n")
+                    else:
+                        page.actions.key_down("CTRL").type("\n").key_up("CTRL")
+                    self._sleep(1.2)
+                    if self._looks_submitted(page):
+                        return True
+                except Exception:
+                    continue
+            self._nudge_input(page, input_ele)
+        return False
+
+    def _find_send_button(self, page: Any) -> Optional[Any]:
+        selectors = list(self.settings.get("send_selectors", []) or [])
+        selectors.extend(
+            [
+                'css:button[aria-label*="Send"]',
+                'css:button[aria-label*="发送"]',
+                'css:button[aria-label*="提交"]',
+                'css:button[title*="Send"]',
+                'css:button[title*="发送"]',
+                'css:button[type="submit"]',
+                'css:[data-testid*="send"]',
+            ]
+        )
+        for selector in selectors:
+            try:
+                elements = page.eles(selector, timeout=1)
+            except Exception:
+                elements = []
+            for ele in elements or []:
+                if self._is_send_like(page, ele):
+                    return ele
+        return None
+
+    def _click_send_button_by_js(self, page: Any) -> bool:
+        try:
+            return bool(
+                page.run_js(
+                    """
+                    const words = ['send', '发送', '提交'];
+                    const banned = ['voice', '语音', 'microphone', 'mic'];
+                    const buttons = [...document.querySelectorAll('button,[role="button"]')];
+                    const visible = el => {
+                      const r = el.getBoundingClientRect();
+                      return r.width > 0 && r.height > 0 && !el.disabled && getComputedStyle(el).visibility !== 'hidden';
+                    };
+                    const found = buttons.find(el => {
+                      const text = [
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.innerText || '',
+                        el.textContent || '',
+                        el.getAttribute('data-testid') || ''
+                      ].join(' ').toLowerCase();
+                      return visible(el) && words.some(w => text.includes(w)) && !banned.some(w => text.includes(w));
+                    });
+                    if (!found) return false;
+                    found.click();
+                    return true;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_send_like(page: Any, ele: Any) -> bool:
+        parts = []
+        for name in ("aria-label", "title", "data-testid"):
+            try:
+                value = ele.attr(name)
+            except Exception:
+                value = ""
+            if value:
+                parts.append(str(value))
+        try:
+            parts.append(ele.text or "")
+        except Exception:
+            pass
+        text = " ".join(parts).lower()
+        text = str(text or "").lower()
+        return any(word in text for word in ("send", "发送", "提交", "submit")) and not any(
+            word in text for word in ("voice", "语音", "microphone", "mic")
+        )
+
+    def _looks_submitted(self, page: Any) -> bool:
+        try:
+            length = int(
+                page.run_js(
+                    """
+                    const el = document.activeElement || document.querySelector('textarea,[contenteditable="true"],[role="textbox"]');
+                    if (!el) return 0;
+                    const text = 'value' in el ? el.value : (el.innerText || el.textContent || '');
+                    return (text || '').trim().length;
+                    """
+                )
+                or 0
+            )
+            if length == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            body = page.ele("tag:body", timeout=1)
+            text = (body.text or "").lower() if body else ""
+            return any(marker in text for marker in ("thinking", "正在", "停止生成", "stop generating"))
+        except Exception:
+            return False
 
     def _input_text_length(self, page: Any, input_ele: Any) -> int:
         values = []
