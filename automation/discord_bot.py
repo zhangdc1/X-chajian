@@ -473,7 +473,7 @@ def build_full_help() -> str:
     )
 
 
-def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str, List[int]]:
+def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str, List[int], Optional[Dict[str, Any]]]:
     action = command["action"]
     if action == "confirm_execute":
         confirm_id = command.get("confirm_id")
@@ -482,11 +482,11 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             return "没有找到这个确认编号，可能已过期或已经执行。", []
         return format_response(pending["command"], client)
     if action == "version":
-        return f"当前运行版本: {BOT_VERSION}", []
+        return f"当前运行版本: {BOT_VERSION}", [], None
     if action == "help":
-        return build_help(), []
+        return build_help(), [], None
     if action == "help_full":
-        return build_full_help(), []
+        return build_full_help(), [], None
     if action == "workers":
         workers = client.workers().get("workers", [])
         if not workers:
@@ -579,8 +579,8 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             f"已按账号评分流程创建任务 {len(job_ids)} 个。\n"
             f"任务ID: {', '.join(str(x) for x in job_ids)}\n"
             f"已清理旧计划 {data.get('cleaned_plans', 0)} 个，旧调度任务 {data.get('cleaned_tasks', 0)} 个。\n"
-            f"本次会读取中央评分提示词，完成后自动生成账号专属调度。"
-        ), job_ids
+            f"后续按分组汇总汇报，不再逐账号刷屏。"
+        ), [], {"kind": "score", "title": f"账号评分 {group_id}", "job_ids": job_ids, "group_id": group_id}
     if action == "create_score_plan_jobs":
         group_id = command.get("group_id")
         if not group_id:
@@ -593,8 +593,8 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             f"已创建账号评分任务 {len(job_ids)} 个。\n"
             f"任务ID: {', '.join(str(x) for x in job_ids)}\n"
             f"已清理旧计划 {data.get('cleaned_plans', 0)} 个，旧调度任务 {data.get('cleaned_tasks', 0)} 个。\n"
-            f"完成后会自动生成账号专属调度。"
-        ), job_ids
+            f"后续按分组汇总汇报，不再逐账号刷屏。"
+        ), [], {"kind": "score", "title": f"账号评分 {group_id}", "job_ids": job_ids, "group_id": group_id}
     if action == "score_plans":
         plans = client.score_plans(command.get("group_id")).get("plans", [])
         if not plans:
@@ -660,7 +660,11 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             preempted = int(data.get("preempted") or 0)
             if preempted:
                 extra = f"\n已抢占当前任务 {preempted} 个，抢占任务已重新排队。"
-        return f"已创建模式{mode}任务 {len(job_ids)} 个。\n任务ID: {', '.join(str(x) for x in job_ids)}{extra}\n我只汇报开始、日志路径和最终结果。", job_ids
+        return (
+            f"已创建模式{mode}任务 {len(job_ids)} 个。\n"
+            f"任务ID: {', '.join(str(x) for x in job_ids)}{extra}\n"
+            f"后续按分组汇总汇报，不再逐账号刷屏。"
+        ), [], {"kind": "mode", "title": f"模式{mode} {group_id}", "job_ids": job_ids, "group_id": group_id, "mode": mode, "preempted": int(data.get("preempted") or 0)}
     if action == "jobs":
         jobs = client.jobs(command.get("status"), command.get("job_type")).get("jobs", [])
         if not jobs:
@@ -790,6 +794,132 @@ async def watch_job(channel: Any, client: CentralClient, job_id: int) -> None:
                 await channel.send(summarize_failed_job(job)[:1900])
             return
     await channel.send(f"任务 {job_id} 仍未结束。可用 !job detail {job_id} 或 !logs {job_id} 查看。")
+
+
+TERMINAL_JOB_STATUSES = {"completed", "failed", "preempted", "cancelled"}
+
+
+def batch_status_counts(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {"total": len(jobs), "queued": 0, "running": 0, "completed": 0, "failed": 0, "preempted": 0, "cancelled": 0}
+    for job in jobs:
+        status = str(job.get("status") or "")
+        if status == "queued":
+            counts["queued"] += 1
+        elif status in {"leased", "cancel_requested"}:
+            counts["running"] += 1
+        elif status == "completed":
+            counts["completed"] += 1
+        elif status == "failed":
+            counts["failed"] += 1
+        elif status == "preempted":
+            counts["preempted"] += 1
+        elif status == "cancelled":
+            counts["cancelled"] += 1
+    return counts
+
+
+def batch_score_extras(jobs: List[Dict[str, Any]]) -> Dict[str, int]:
+    extras = {"grok": 0, "fallback": 0, "scheduled": 0}
+    for job in jobs:
+        if job.get("status") != "completed":
+            continue
+        result = job.get("result") or {}
+        if result.get("status") == "stub":
+            extras["fallback"] += 1
+        else:
+            extras["grok"] += 1
+        parsed = result.get("parsed_plan") or {}
+        days = parsed.get("days") or []
+        if days:
+            extras["scheduled"] += 1
+    return extras
+
+
+def failed_job_lines(jobs: List[Dict[str, Any]], limit: int = 5) -> List[str]:
+    lines = []
+    for job in jobs:
+        if job.get("status") not in {"failed", "cancelled"}:
+            continue
+        payload = job.get("payload") or {}
+        account = payload.get("profile_name") or payload.get("profile_id") or payload.get("account_id") or "-"
+        reason = job.get("error") or "未知原因"
+        lines.append(f"- job={job.get('id')} {account}: {reason}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def render_batch_summary(title: str, jobs: List[Dict[str, Any]], kind: str, final: bool = False, preempted: int = 0) -> str:
+    counts = batch_status_counts(jobs)
+    parts = [
+        f"{title}{' 最终汇总' if final else ' 汇总'}：总{counts['total']}",
+        f"排队{counts['queued']}",
+        f"执行中{counts['running']}",
+        f"成功{counts['completed']}",
+        f"失败{counts['failed']}",
+    ]
+    if counts["preempted"] or preempted:
+        parts.append(f"抢占/重排{counts['preempted'] + preempted}")
+    if counts["cancelled"]:
+        parts.append(f"取消{counts['cancelled']}")
+    if kind == "score":
+        extras = batch_score_extras(jobs)
+        parts.append(f"Grok成功{extras['grok']}")
+        parts.append(f"兜底{extras['fallback']}")
+        parts.append(f"已生成调度{extras['scheduled']}")
+    lines = ["，".join(parts)]
+    if final:
+        failures = failed_job_lines(jobs)
+        if failures:
+            lines.append("失败明细（最多5条）：")
+            lines.extend(failures)
+            if counts["failed"] + counts["cancelled"] > len(failures):
+                lines.append("更多失败请到 Web 后台任务中心查看。")
+    return "\n".join(lines)
+
+
+async def watch_job_batch(channel: Any, client: CentralClient, batch: Dict[str, Any]) -> None:
+    job_ids = [int(x) for x in (batch.get("job_ids") or [])]
+    if not job_ids:
+        return
+    title = str(batch.get("title") or "任务")
+    kind = str(batch.get("kind") or "jobs")
+    preempted = int(batch.get("preempted") or 0)
+    last_signature = ""
+    last_sent = 0.0
+    for _ in range(1440):
+        await asyncio.sleep(5)
+        jobs: List[Dict[str, Any]] = []
+        failed_fetch = False
+        for job_id in job_ids:
+            try:
+                job = client.job(job_id).get("job") or {}
+                if job:
+                    jobs.append(job)
+            except Exception:
+                failed_fetch = True
+        if not jobs:
+            if failed_fetch:
+                await channel.send(f"{title} 汇总查询失败，稍后可到 Web 后台查看。")
+            return
+        counts = batch_status_counts(jobs)
+        signature = json.dumps(counts, sort_keys=True, ensure_ascii=False)
+        has_failure = counts["failed"] or counts["cancelled"]
+        has_preempted = counts["preempted"] or preempted
+        all_done = counts["completed"] + counts["failed"] + counts["preempted"] + counts["cancelled"] >= counts["total"]
+        now = time.time()
+        should_send = False
+        if signature != last_signature and (has_failure or has_preempted or all_done):
+            should_send = True
+        elif signature != last_signature and now - last_sent >= 60:
+            should_send = True
+        if should_send:
+            await channel.send(render_batch_summary(title, jobs, kind, final=all_done, preempted=preempted)[:1900])
+            last_signature = signature
+            last_sent = now
+        if all_done:
+            return
+    await channel.send(f"{title} 仍未全部结束。请到 Web 后台任务中心查看详情。")
 
 
 def should_send_job_run(job_type: Optional[str], status: str, message: str) -> bool:
@@ -1009,13 +1139,21 @@ def build_discord_client(discord: Any, central: CentralClient, prefix: str, allo
             content = content[len(prefix):].strip()
         raw_content = content
         command = maybe_semantic_command(parse_command(content), raw_content, config)
+        batch = None
         try:
-            response, job_ids = format_response(command, central)
+            formatted = format_response(command, central)
+            if len(formatted) == 3:
+                response, job_ids, batch = formatted
+            else:
+                response, job_ids = formatted
         except Exception as exc:
-            response, job_ids = f"执行失败: {exc}", []
+            response, job_ids, batch = f"执行失败: {exc}", [], None
         await message.channel.send(response[:1900])
-        for job_id in job_ids:
-            asyncio.create_task(watch_job(message.channel, central, job_id))
+        if batch:
+            asyncio.create_task(watch_job_batch(message.channel, central, batch))
+        else:
+            for job_id in job_ids:
+                asyncio.create_task(watch_job(message.channel, central, job_id))
 
     return client
 

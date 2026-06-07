@@ -1177,6 +1177,7 @@ class Storage:
                 )
             current = self._get_json_setting(conn, f"worker_config:{node_id}", {})
             current["updated_at"] = ts
+            current["config_version"] = ts
             self._set_json_setting(conn, f"worker_config:{node_id}", current)
         return {"node_id": node_id, "sync_group_ids": normalized, "sync_groups": len(normalized)}
 
@@ -1916,16 +1917,18 @@ class Storage:
             ).fetchall()
             account_group_rows = conn.execute(
                 """
-                SELECT node_id, GROUP_CONCAT(DISTINCT group_id) AS group_ids
+                SELECT node_id, GROUP_CONCAT(DISTINCT group_id) AS group_ids, COUNT(*) AS account_count
                 FROM accounts
                 WHERE status = 'active' AND COALESCE(group_id, '') <> ''
                 GROUP BY node_id
                 """
             ).fetchall()
-        account_groups_by_node = {
-            str(row["node_id"]): [item for item in str(row["group_ids"] or "").split(",") if item]
-            for row in account_group_rows
-        }
+        account_groups_by_node = {}
+        account_counts_by_node = {}
+        for row in account_group_rows:
+            node_key = str(row["node_id"])
+            account_groups_by_node[node_key] = [item for item in str(row["group_ids"] or "").split(",") if item]
+            account_counts_by_node[node_key] = int(row["account_count"] or 0)
         result = []
         for row in rows:
             item = dict(row)
@@ -1945,6 +1948,7 @@ class Storage:
             item["last_reported_sync_group_ids"] = runtime_groups
             item["runtime_sync_group_ids"] = runtime_groups
             item["account_group_ids"] = account_groups
+            item["account_count"] = account_counts_by_node.get(str(item.get("node_id") or ""), 0)
             item["sync_mismatch"] = item["online"] and sorted(central_groups) != sorted(runtime_groups) if runtime_groups else False
             item["account_mismatch"] = bool(item["online"] and account_groups and runtime_groups and sorted(account_groups) != sorted(runtime_groups))
             result.append(item)

@@ -253,32 +253,45 @@ function renderJobsMini(jobs) {
 async function loadWorkers() {
   const data = await api("/admin/api/workers?limit=200");
   $("workersTable").innerHTML = table([
-    th("电脑"), th("标签"), th("在线"), th("Grok"), th("当前同步分组"), th("中央配置分组"), th("账号来源分组"), th("一致性"), th("当前任务"), th("最后心跳"), th("操作"),
+    th("电脑"), th("标签"), th("在线"), th("Grok"), th("目标同步分组"), th("当前运行分组"), th("一致性"), th("账号数"), th("当前任务"), th("最后心跳"), th("操作"),
   ], data.workers.map(w => {
     const cfg = w.central_config || {};
     const current = (w.meta || {}).current_job || {};
     const central = w.central_sync_group_ids || cfg.sync_group_ids || [];
-    const runtime = w.current_sync_group_ids || w.runtime_sync_group_ids || [];
+    const runtime = w.current_sync_group_ids || [];
+    const lastReported = w.last_reported_sync_group_ids || w.runtime_sync_group_ids || [];
     const accounts = w.account_group_ids || [];
-    const mismatch = w.sync_mismatch || w.account_mismatch;
+    const mismatchText = workerMismatchText(w, central, runtime, accounts);
+    const accountCount = Number(w.account_count || 0);
     return `<tr>
       <td>${esc(w.node_id)}</td>
       <td>${esc(w.label)}</td>
       <td>${w.online ? statusPill("online") : statusPill("offline")}</td>
       <td>${cfg.enable_grok_browser ? statusPill("active") : statusPill("inactive")}</td>
-      <td class="wrap">${esc(runtime.join(", ") || "-")}</td>
       <td class="wrap">${esc(central.join(", ") || "-")}</td>
-      <td class="wrap">${esc(accounts.join(", ") || "-")}</td>
-      <td>${mismatch ? '<span class="pill warn">待同步/不一致</span>' : '<span class="pill ok">一致</span>'}</td>
+      <td class="wrap">${esc((w.online ? runtime : lastReported).join(", ") || "-")}${!w.online && lastReported.length ? '<div class="small muted">最后上报，电脑离线</div>' : ""}</td>
+      <td>${mismatchText}</td>
+      <td>${accountCount}<div class="small muted">${esc(accounts.join(", ") || "-")}</div></td>
       <td class="wrap">${current.id ? `job=${esc(current.id)} ${esc(current.job_type || "")}` : "-"}</td>
       <td>${fmtTime(w.last_seen)}<div class="small muted">${w.offline_seconds || 0} 秒前</div></td>
       <td>
         <button class="ghost" onclick="editWorkerConfig('${esc(w.node_id)}')">配置</button>
-        ${runtime.length ? `<button class="ghost" onclick='useCurrentWorkerGroups("${esc(w.node_id)}", ${JSON.stringify(runtime).replaceAll("'", "&#39;")})'>当前覆盖中央</button>` : ""}
+        <button class="ghost" onclick='editWorkerGroups("${esc(w.node_id)}", ${JSON.stringify(central).replaceAll("'", "&#39;")})'>编辑目标分组</button>
+        ${runtime.length ? `<button class="ghost" onclick='useCurrentWorkerGroups("${esc(w.node_id)}", ${JSON.stringify(runtime).replaceAll("'", "&#39;")})'>用当前覆盖目标</button>` : ""}
+        ${accounts.length ? `<button class="ghost" onclick='useAccountWorkerGroups("${esc(w.node_id)}", ${JSON.stringify(accounts).replaceAll("'", "&#39;")})'>用账号来源覆盖</button>` : ""}
         <button class="ghost" onclick='showDetail("电脑详情", ${JSON.stringify(w).replaceAll("'", "&#39;")})'>详情</button>
       </td>
     </tr>`;
   }));
+}
+
+function workerMismatchText(worker, central, runtime, accounts) {
+  const same = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+  if (!worker.online) return '<span class="pill warn">电脑离线无法确认</span>';
+  if (!runtime.length && central.length) return '<span class="pill warn">等待客户端同步</span>';
+  if (!same(central, runtime)) return '<span class="pill warn">客户端仍在旧分组运行</span>';
+  if (accounts.length && !same(accounts, runtime)) return '<span class="pill warn">账号来源与运行分组不一致</span>';
+  return '<span class="pill ok">正常</span>';
 }
 
 async function loadGroups() {
@@ -729,11 +742,36 @@ async function editWorkerConfig(nodeId) {
 async function useCurrentWorkerGroups(nodeId, groupIds) {
   const groups = Array.isArray(groupIds) ? groupIds : [];
   if (!groups.length) return alert("当前没有可覆盖的运行分组");
-  if (!confirm(`确认用 ${nodeId} 当前运行分组覆盖中央配置？\n${groups.join(", ")}`)) return;
+  if (!confirm(`确认用 ${nodeId} 当前运行分组覆盖目标同步分组？\n${groups.join(", ")}`)) return;
   await api(`/admin/api/workers/${encodeURIComponent(nodeId)}/sync-groups`, {
     method: "POST",
     body: JSON.stringify({ sync_group_ids: groups }),
   });
+  alert("目标同步分组已保存，Worker 下一轮配置刷新后生效。");
+  await loadWorkers();
+}
+
+async function editWorkerGroups(nodeId, groupIds) {
+  const current = Array.isArray(groupIds) ? groupIds.join(", ") : "";
+  const groupsText = prompt("目标同步分组，多个用逗号或换行分隔", current);
+  if (groupsText === null) return;
+  await api(`/admin/api/workers/${encodeURIComponent(nodeId)}/sync-groups`, {
+    method: "POST",
+    body: JSON.stringify({ sync_group_ids: groupsText }),
+  });
+  alert("目标同步分组已保存，Worker 下一轮配置刷新后生效。");
+  await loadWorkers();
+}
+
+async function useAccountWorkerGroups(nodeId, groupIds) {
+  const groups = Array.isArray(groupIds) ? groupIds : [];
+  if (!groups.length) return alert("当前没有账号来源分组可覆盖");
+  if (!confirm(`确认用 ${nodeId} 的账号来源分组覆盖目标同步分组？\n${groups.join(", ")}`)) return;
+  await api(`/admin/api/workers/${encodeURIComponent(nodeId)}/sync-groups`, {
+    method: "POST",
+    body: JSON.stringify({ sync_group_ids: groups }),
+  });
+  alert("目标同步分组已保存，Worker 下一轮配置刷新后生效。");
   await loadWorkers();
 }
 
@@ -777,3 +815,5 @@ window.toggleJob = toggleJob;
 window.toggleAll = toggleAll;
 window.editWorkerConfig = editWorkerConfig;
 window.useCurrentWorkerGroups = useCurrentWorkerGroups;
+window.editWorkerGroups = editWorkerGroups;
+window.useAccountWorkerGroups = useAccountWorkerGroups;
