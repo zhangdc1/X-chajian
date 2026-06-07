@@ -794,6 +794,19 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if path == "/admin/api/score-fallback-config":
                 write_json(self, 200, {"ok": True, "config": self.storage.get_score_fallback_config()})
                 return
+            if path == "/admin/api/search-keywords":
+                keywords = self.storage.get_search_keywords()
+                write_json(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "keywords": keywords,
+                        "text": "\n".join(keywords),
+                        "count": len(keywords),
+                    },
+                )
+                return
         except Exception as exc:
             write_json(self, 500, {"ok": False, "error": str(exc)})
             return
@@ -869,6 +882,16 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 config = self.storage.update_worker_default_config(payload)
                 self._audit(user, "update_worker_default_config", "setting", "worker_default_config", {"keys": sorted(payload.keys())})
                 write_json(self, 200, {"ok": True, "config": config})
+                return
+            if path == "/admin/api/model-config/apply":
+                result = self.storage.apply_model_config(
+                    scope=payload.get("scope", "all"),
+                    model_config=payload.get("model_config") or {},
+                    node_ids=payload.get("node_ids") or payload.get("nodes") or [],
+                    group_ids=payload.get("group_ids") or payload.get("groups") or [],
+                )
+                self._audit(user, "apply_model_config", "setting", "model_config", {"result": result})
+                write_json(self, 200, {"ok": True, **result})
                 return
             if path == "/admin/api/score-fallback-config":
                 config = self.storage.update_score_fallback_config(payload)
@@ -974,6 +997,12 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.storage.set_setting("score_prompt", prompt)
                 self._audit(user, "reset_score_prompt", "setting", "score_prompt", {"length": len(prompt)})
                 write_json(self, 200, {"ok": True, "prompt": prompt})
+                return
+            if path == "/admin/api/search-keywords":
+                raw = payload.get("keywords", payload.get("text", ""))
+                keywords = self.storage.update_search_keywords(raw)
+                self._audit(user, "update_search_keywords", "setting", "farming_search_keywords", {"count": len(keywords)})
+                write_json(self, 200, {"ok": True, "keywords": keywords, "text": "\n".join(keywords), "count": len(keywords)})
                 return
         except Exception as exc:
             self._audit(user, "admin_action_failed", "", "", {"path": path, "error": str(exc)}, ok=False)

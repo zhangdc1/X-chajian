@@ -4,6 +4,8 @@ const state = {
   selectedTaskIds: new Set(),
   selectedJobIds: new Set(),
   lastSettings: null,
+  cachedWorkers: [],
+  cachedGroups: [],
 };
 
 const titles = {
@@ -443,11 +445,16 @@ async function loadSchedule() {
 }
 
 async function loadAudit() {
-  const [audit, settings] = await Promise.all([
+  const [audit, settings, keywords, workers, groups] = await Promise.all([
     api("/admin/api/audit?limit=200"),
     api("/admin/api/settings"),
+    api("/admin/api/search-keywords"),
+    api("/admin/api/workers?limit=500"),
+    api("/admin/api/groups?limit=500"),
   ]);
   state.lastSettings = settings.settings || {};
+  state.cachedWorkers = workers.workers || [];
+  state.cachedGroups = groups.groups || [];
   $("auditTable").innerHTML = table([th("ID"), th("管理员"), th("动作"), th("目标"), th("结果"), th("时间")], audit.logs.map(l => `
     <tr>
       <td>${l.id}</td>
@@ -458,20 +465,37 @@ async function loadAudit() {
       <td>${fmtTime(l.created_at)}</td>
     </tr>`));
   $("settingsBox").innerHTML = renderSettings(settings.settings || {});
+  $("searchKeywordsText").value = keywords.text || "";
+  $("searchKeywordsCount").textContent = `${keywords.count || 0} 条`;
 }
 
 function renderSettings(settings) {
   const cfg = settings.worker_default_config || {};
   const model = cfg.model_config || {};
+  const smart = model.smart_comment || {};
+  const workers = (state.cachedWorkers || []);
+  const groups = (state.cachedGroups || []);
+  const workerOptions = workers.map(w => `<option value="${esc(w.node_id)}">${esc(w.node_id)} | ${esc(w.label || "")}</option>`).join("");
+  const groupOptions = groups.map(g => `<option value="${esc(g.group_id)}">${esc(g.alias || "-")} | ${esc(g.group_id)}</option>`).join("");
   return `
     <div class="table-wrap compact"><table><tbody>
       <tr><th>管理员</th><td>${esc(settings.admin_user || "-")}</td></tr>
       <tr><th>Token 指纹</th><td>${esc(settings.token_fingerprint || "-")}</td></tr>
       <tr><th>数据库</th><td class="wrap">${esc(settings.db_path || "-")}</td></tr>
       <tr><th>模型启用</th><td><label class="check"><input id="modelEnabled" type="checkbox" ${model.enabled ? "checked" : ""}>启用</label></td></tr>
+      <tr><th>智能评论</th><td><label class="check"><input id="smartCommentEnabled" type="checkbox" ${smart.enabled !== false ? "checked" : ""}>默认开启智能评论</label></td></tr>
       <tr><th>Base URL</th><td><input id="modelBaseUrl" value="${esc(model.base_url || "")}"></td></tr>
       <tr><th>API Key</th><td><input id="modelApiKey" value="${esc(model.api_key || "")}" placeholder="留空或保留掩码则不替换"></td></tr>
       <tr><th>模型名称</th><td><input id="modelName" value="${esc(model.model || "")}"></td></tr>
+      <tr><th>下发范围</th><td>
+        <select id="modelApplyScope">
+          <option value="all">全部电脑</option>
+          <option value="nodes">选中电脑</option>
+          <option value="groups">选中分组当前在线电脑</option>
+        </select>
+      </td></tr>
+      <tr><th>选中电脑</th><td><select id="modelNodeIds" multiple size="5">${workerOptions}</select><div class="small muted">范围为“选中电脑”时生效，可按住 Ctrl 多选。</div></td></tr>
+      <tr><th>选中分组</th><td><select id="modelGroupIds" multiple size="5">${groupOptions}</select><div class="small muted">范围为“选中分组”时，按当前 Worker 心跳上报的实际同步分组匹配电脑。</div></td></tr>
     </tbody></table></div>`;
 }
 
@@ -642,21 +666,45 @@ async function saveFallbackConfig() {
 }
 
 async function saveModelConfig() {
-  const existing = ((state.lastSettings || {}).worker_default_config || {});
-  const oldModel = existing.model_config || {};
   const keyText = $("modelApiKey").value.trim();
   const model_config = {
     enabled: $("modelEnabled").checked,
     provider: "openai_compatible",
     base_url: $("modelBaseUrl").value.trim(),
     model: $("modelName").value.trim(),
+    smart_comment: {
+      enabled: $("smartCommentEnabled").checked,
+      auto_publish: true,
+      save_drafts: true,
+      fallback_to_static: true,
+      output_path: "automation/output/comment_drafts.jsonl",
+    },
   };
   if (keyText && !keyText.includes("***") && !keyText.includes("...")) {
     model_config.api_key = keyText;
   }
-  await api("/admin/api/worker-default-config", { method: "POST", body: JSON.stringify({ model_config }) });
-  alert("默认模型配置已保存");
+  const scope = $("modelApplyScope").value;
+  const node_ids = Array.from($("modelNodeIds").selectedOptions).map(opt => opt.value);
+  const group_ids = Array.from($("modelGroupIds").selectedOptions).map(opt => opt.value);
+  if (scope === "nodes" && !node_ids.length) return alert("请选择至少一台电脑");
+  if (scope === "groups" && !group_ids.length) return alert("请选择至少一个分组");
+  const result = await api("/admin/api/model-config/apply", {
+    method: "POST",
+    body: JSON.stringify({ scope, node_ids, group_ids, model_config }),
+  });
+  alert(scope === "all" ? `模型配置已保存并下发到 ${result.count || 0} 台已知电脑` : `模型配置已下发到 ${result.count || 0} 台电脑`);
   await loadAudit();
+}
+
+async function saveSearchKeywords() {
+  const text = $("searchKeywordsText").value;
+  const data = await api("/admin/api/search-keywords", {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+  $("searchKeywordsText").value = data.text || "";
+  $("searchKeywordsCount").textContent = `${data.count || 0} 条`;
+  alert("搜索提示词词库已保存，Worker 下一轮配置刷新后会同步到本地模式一关键词。");
 }
 
 async function editWorkerConfig(nodeId) {
@@ -710,6 +758,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("resetPromptBtn").addEventListener("click", resetPrompt);
   $("saveFallbackBtn").addEventListener("click", saveFallbackConfig);
   $("saveModelBtn").addEventListener("click", saveModelConfig);
+  $("saveSearchKeywordsBtn").addEventListener("click", saveSearchKeywords);
   checkSession().catch(err => console.error(err));
 });
 

@@ -16,6 +16,13 @@ DEFAULT_MODEL_CONFIG = {
     "base_url": "https://api.deepseek.com/v1",
     "api_key": "sk-8dc4ccade0764eab89c44692a68ac06b",
     "model": "deepseek-v4-flash",
+    "smart_comment": {
+        "enabled": True,
+        "auto_publish": True,
+        "save_drafts": True,
+        "fallback_to_static": True,
+        "output_path": "automation/output/comment_drafts.jsonl",
+    },
 }
 
 DEFAULT_SCORE_FALLBACK_CONFIG = {
@@ -440,6 +447,7 @@ class Storage:
             "worker_config_interval_seconds": 30,
             "stale_job_grace_seconds": 3600,
             "model_config": dict(DEFAULT_MODEL_CONFIG),
+            "search_keywords": [],
         }
 
     def finalize_expired_leases(self, grace_seconds: int = 180) -> Dict[str, int]:
@@ -524,6 +532,60 @@ class Storage:
             (key, json.dumps(value, ensure_ascii=False), now_ts()),
         )
 
+    @staticmethod
+    def normalize_search_keywords(value: Any) -> list[str]:
+        if isinstance(value, str):
+            parts = value.replace("\r", "\n").replace(",", "\n").split("\n")
+        elif isinstance(value, (list, tuple, set)):
+            parts = list(value)
+        else:
+            parts = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in parts:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result[:500]
+
+    def _bump_worker_default_config_version(self, conn: sqlite3.Connection) -> int:
+        ts = now_ts()
+        current = self._get_json_setting(conn, "worker_default_config", self.default_worker_config())
+        current["updated_at"] = ts
+        current["config_version"] = ts
+        self._set_json_setting(conn, "worker_default_config", current)
+        return ts
+
+    def get_search_keywords(self) -> list[str]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value_text FROM app_settings WHERE key = 'farming_search_keywords'").fetchone()
+        if not row:
+            return []
+        try:
+            loaded = json.loads(str(row["value_text"] or "[]"))
+        except json.JSONDecodeError:
+            loaded = str(row["value_text"] or "")
+        return self.normalize_search_keywords(loaded)
+
+    def update_search_keywords(self, value: Any) -> list[str]:
+        keywords = self.normalize_search_keywords(value)
+        ts = now_ts()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value_text, updated_at)
+                VALUES ('farming_search_keywords', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_text = excluded.value_text,
+                    updated_at = excluded.updated_at
+                """,
+                (json.dumps(keywords, ensure_ascii=False), ts),
+            )
+            self._bump_worker_default_config_version(conn)
+        return keywords
+
     def get_score_fallback_config(self) -> Dict[str, Any]:
         with self.connect() as conn:
             cfg = self._get_json_setting(conn, "score_fallback_config", DEFAULT_SCORE_FALLBACK_CONFIG)
@@ -581,6 +643,8 @@ class Storage:
             cfg["label"] = worker_row["label"] or node_id
         cfg.setdefault("label", node_id)
         cfg["sync_group_ids"] = [str(row["group_id"]) for row in sync_rows]
+        cfg["search_keywords"] = self.get_search_keywords()
+        cfg["model_config"] = self._merge_model_config(DEFAULT_MODEL_CONFIG, dict(cfg.get("model_config") or {}))
         cfg["config_version"] = int(
             max(
                 int(cfg.get("config_version") or 0),
@@ -611,8 +675,13 @@ class Storage:
             current = self._get_json_setting(conn, f"worker_config:{node_id}", {})
             for key, value in (updates or {}).items():
                 if key in allowed:
-                    current[key] = value
+                    if key == "model_config" and isinstance(value, dict):
+                        model_current = dict(current.get("model_config") or self.default_worker_config().get("model_config") or {})
+                        current[key] = self._merge_model_config(model_current, value)
+                    else:
+                        current[key] = value
             current["updated_at"] = now_ts()
+            current["config_version"] = current["updated_at"]
             self._set_json_setting(conn, f"worker_config:{node_id}", current)
             if "label" in updates:
                 conn.execute(
@@ -642,28 +711,85 @@ class Storage:
                 if key in allowed:
                     if key == "model_config" and isinstance(value, dict):
                         model_current = dict(current.get("model_config") or self.default_worker_config().get("model_config") or {})
-                        for model_key, model_value in value.items():
-                            if model_key == "api_key" and (not str(model_value or "").strip() or "***" in str(model_value) or "..." in str(model_value)):
-                                continue
-                            model_current[model_key] = model_value
-                        current[key] = model_current
+                        current[key] = self._merge_model_config(model_current, value)
                     else:
                         current[key] = value
             current["updated_at"] = now_ts()
+            current["config_version"] = current["updated_at"]
             self._set_json_setting(conn, "worker_default_config", current)
         cfg = dict(self.default_worker_config())
         cfg.update(current)
+        cfg["model_config"] = self._merge_model_config(DEFAULT_MODEL_CONFIG, dict(cfg.get("model_config") or {}))
         cfg["central_token"] = self._mask_secret(str(cfg.get("central_token") or ""))
         model_cfg = dict(cfg.get("model_config") or {})
         model_cfg["api_key"] = self._mask_secret(str(model_cfg.get("api_key") or ""))
         cfg["model_config"] = model_cfg
         return cfg
 
+    @staticmethod
+    def _merge_model_config(current: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(DEFAULT_MODEL_CONFIG)
+        merged.update(current or {})
+        for key, value in (updates or {}).items():
+            if key == "api_key" and (not str(value or "").strip() or "***" in str(value) or "..." in str(value)):
+                continue
+            if key == "smart_comment" and isinstance(value, dict):
+                smart_current = dict(merged.get("smart_comment") or DEFAULT_MODEL_CONFIG.get("smart_comment") or {})
+                for smart_key, smart_value in value.items():
+                    smart_current[smart_key] = smart_value
+                merged["smart_comment"] = smart_current
+                continue
+            merged[key] = value
+        return merged
+
+    def resolve_model_config_target_nodes(self, scope: str, node_ids: Any = None, group_ids: Any = None) -> list[str]:
+        scope = str(scope or "all").strip().lower()
+        nodes: set[str] = set()
+        if scope == "all":
+            with self.connect() as conn:
+                rows = conn.execute("SELECT node_id FROM worker_nodes ORDER BY node_id").fetchall()
+            nodes.update(str(row["node_id"]) for row in rows if row["node_id"])
+        elif scope == "nodes":
+            raw = node_ids or []
+            if isinstance(raw, str):
+                raw = raw.replace("\n", ",").split(",")
+            nodes.update(str(item).strip() for item in raw if str(item).strip())
+        elif scope == "groups":
+            raw_groups = group_ids or []
+            if isinstance(raw_groups, str):
+                raw_groups = raw_groups.replace("\n", ",").split(",")
+            wanted = {str(item).strip() for item in raw_groups if str(item).strip()}
+            for worker in self.list_workers(limit=1000):
+                if not worker.get("online"):
+                    continue
+                runtime_groups = {str(item) for item in (worker.get("current_sync_group_ids") or []) if str(item)}
+                if wanted & runtime_groups:
+                    nodes.add(str(worker.get("node_id") or ""))
+        else:
+            raise ValueError("invalid scope")
+        return sorted(item for item in nodes if item)
+
+    def apply_model_config(self, scope: str, model_config: Dict[str, Any], node_ids: Any = None, group_ids: Any = None) -> Dict[str, Any]:
+        scope = str(scope or "all").strip().lower()
+        if not isinstance(model_config, dict):
+            raise ValueError("missing model_config")
+        if scope == "all":
+            config = self.update_worker_default_config({"model_config": model_config})
+            target_nodes = self.resolve_model_config_target_nodes("all")
+            for node_id in target_nodes:
+                self.update_worker_config(node_id, {"model_config": model_config})
+            return {"scope": scope, "nodes": target_nodes, "count": len(target_nodes), "config": config}
+        target_nodes = self.resolve_model_config_target_nodes(scope, node_ids=node_ids, group_ids=group_ids)
+        for node_id in target_nodes:
+            self.update_worker_config(node_id, {"model_config": model_config})
+        return {"scope": scope, "nodes": target_nodes, "count": len(target_nodes)}
+
     def get_worker_default_config(self, mask_secrets: bool = True) -> Dict[str, Any]:
         with self.connect() as conn:
             current = self._get_json_setting(conn, "worker_default_config", self.default_worker_config())
         cfg = dict(self.default_worker_config())
         cfg.update(current)
+        cfg["model_config"] = self._merge_model_config(DEFAULT_MODEL_CONFIG, dict(cfg.get("model_config") or {}))
         if mask_secrets:
             cfg["central_token"] = self._mask_secret(str(cfg.get("central_token") or ""))
             model_cfg = dict(cfg.get("model_config") or {})

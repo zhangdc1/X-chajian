@@ -40,6 +40,13 @@ DEFAULT_MODEL_CONFIG = {
     "base_url": "https://api.deepseek.com/v1",
     "api_key": "sk-8dc4ccade0764eab89c44692a68ac06b",
     "model": "deepseek-v4-flash",
+    "smart_comment": {
+        "enabled": True,
+        "auto_publish": True,
+        "save_drafts": True,
+        "fallback_to_static": True,
+        "output_path": "automation/output/comment_drafts.jsonl",
+    },
 }
 DEFAULT_WORKER_CONFIG = {
     "central_api": DEFAULT_CENTRAL_API,
@@ -275,6 +282,13 @@ class Worker:
         if "sync_group_ids" in central_config and assigned_groups != [str(item).strip() for item in (self.config.get("sync_group_ids") or [])]:
             self.config["sync_group_ids"] = assigned_groups
             changed = True
+        if "search_keywords" in central_config:
+            keywords = self.normalize_search_keywords(central_config.get("search_keywords"))
+            if keywords and keywords != self.normalize_search_keywords(self.config.get("search_keywords")):
+                self.config["search_keywords"] = keywords
+                changed = True
+            if keywords:
+                self.write_legacy_search_keywords(keywords)
         if self.label != str(self.config.get("label") or self.node_id):
             self.label = str(self.config.get("label") or self.node_id)
         model_config = central_config.get("model_config")
@@ -286,6 +300,46 @@ class Worker:
                 print("updated local automation_config.yaml from central")
             except Exception as exc:
                 print(f"save central worker config failed: {exc}")
+
+    @staticmethod
+    def normalize_search_keywords(value: Any) -> list[str]:
+        if isinstance(value, str):
+            parts = value.replace("\r", "\n").replace(",", "\n").split("\n")
+        elif isinstance(value, (list, tuple, set)):
+            parts = list(value)
+        else:
+            parts = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in parts:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def write_legacy_search_keywords(self, keywords: list[str]) -> None:
+        if yaml is None or not keywords:
+            return
+        path = self.app_root() / "config.yaml"
+        current: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                current = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                current = {}
+        farm = dict(current.get("FARMING_CONFIG") or {})
+        if farm.get("keywords") == keywords:
+            return
+        farm["keywords"] = keywords
+        current["FARMING_CONFIG"] = farm
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(current, f, allow_unicode=True, sort_keys=False)
+            print("updated config.yaml FARMING_CONFIG.keywords from central")
+        except Exception as exc:
+            print(f"save central search keywords failed: {exc}")
 
     def write_model_config(self, model_config: Dict[str, Any]) -> None:
         if yaml is None:
@@ -610,6 +664,15 @@ class Worker:
         mode = int(payload.get("mode") or 1)
         if mode not in {1, 2, 3}:
             raise ValueError(f"unsupported legacy mode: {mode}")
+        payload = dict(payload)
+        if mode == 1:
+            keywords = self.normalize_search_keywords(self.config.get("search_keywords"))
+            overrides = dict(payload.get("config_overrides") or {})
+            farm = dict(overrides.get("FARMING_CONFIG") or {})
+            if keywords and not farm.get("keywords"):
+                farm["keywords"] = keywords
+                overrides["FARMING_CONFIG"] = farm
+                payload["config_overrides"] = overrides
         job_id = int(payload.get("_job_id", 0) or 0)
         timeout_seconds = int(self.config.get("legacy_job_timeout_seconds", 7200))
         self.log_job(

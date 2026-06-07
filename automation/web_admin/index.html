@@ -206,8 +206,18 @@
             <div class="panel-head"><h2>模型与系统设置</h2></div>
             <div id="settingsBox"></div>
             <div class="row-actions">
-              <button id="saveModelBtn">保存默认模型配置</button>
+              <button id="saveModelBtn">保存/下发模型配置</button>
             </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>搜索提示词词库</h2>
+            <span id="searchKeywordsCount" class="small muted"></span>
+          </div>
+          <textarea id="searchKeywordsText" rows="10" placeholder="一行一个搜索词，例如：&#10;AI 最新资讯&#10;Web3 项目动态&#10;日本株"></textarea>
+          <div class="row-actions">
+            <button id="saveSearchKeywordsBtn">保存搜索词库</button>
           </div>
         </div>
       </section>
