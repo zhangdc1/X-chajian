@@ -116,16 +116,33 @@ function statusPill(status) {
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    cache: "no-store",
-    ...options,
-  });
+  const timeoutMs = Number(options.timeoutMs || 15000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(path, {
+      credentials: "include",
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      cache: "no-store",
+      ...options,
+      signal: options.signal || controller.signal,
+    });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error("请求超时，请稍后刷新");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   let data = {};
   try { data = await res.json(); } catch (_) {}
   if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    err.path = path;
+    throw err;
   }
   return data;
 }
@@ -256,7 +273,7 @@ async function refreshCurrent() {
     $("refreshHint").textContent = `最后刷新：${new Date().toLocaleString("zh-CN", { hour12: false })}`;
   } catch (err) {
     $("refreshHint").textContent = `刷新失败：${err.message}`;
-    throw err;
+    alert(`刷新失败：${err.message}`);
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;
@@ -280,7 +297,7 @@ async function checkSession() {
     $("loginView").classList.add("hidden");
     $("appView").classList.remove("hidden");
     await refreshCurrent();
-  } catch (_) {
+  } catch (err) {
     $("appView").classList.add("hidden");
     $("loginView").classList.remove("hidden");
   }
@@ -345,7 +362,7 @@ function renderJobsMini(jobs) {
 async function loadWorkers() {
   const data = await api("/admin/api/workers?limit=200");
   $("workersTable").innerHTML = table([
-    th("电脑"), th("标签"), th("在线"), th("Grok"), th("目标同步分组"), th("当前运行分组"), th("一致性"), th("账号数"), th("当前任务"), th("最后心跳"), th("操作"),
+    th("电脑"), th("标签"), th("在线"), th("Grok"), th("目标同步分组"), th("当前运行分组"), th("一致性"), th("账号数"), th("当前任务"), th("诊断"), th("最后心跳"), th("操作"),
   ], data.workers.map(w => {
     const cfg = w.central_config || {};
     const current = (w.meta || {}).current_job || {};
@@ -365,6 +382,11 @@ async function loadWorkers() {
       <td>${mismatchText}</td>
       <td>${accountCount}<div class="small muted">${esc(accounts.join(", ") || "-")}</div></td>
       <td class="wrap">${current.id ? `job=${esc(current.id)} ${esc(current.job_type || "")}` : "-"}</td>
+      <td class="wrap">
+        <div class="small muted">配置:${fmtTime((w.meta || {}).last_config_refresh_at)}</div>
+        <div class="small muted">账号:${fmtTime((w.meta || {}).last_profile_sync_at)}</div>
+        ${(w.meta || {}).last_worker_error ? `<div class="small error-line">${esc((w.meta || {}).last_worker_error)}</div>` : ""}
+      </td>
       <td>${fmtTime(w.last_seen)}<div class="small muted">${w.offline_seconds || 0} 秒前</div></td>
       <td>
         <button class="ghost" onclick="editWorkerConfig('${esc(w.node_id)}')">配置</button>

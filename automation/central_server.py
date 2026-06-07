@@ -70,7 +70,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
     admin_password_hash: str
     admin_session_secret: str
     admin_cookie_name = "xbot_admin_session"
-    admin_session_seconds = 8 * 3600
+    admin_session_seconds = 7 * 24 * 3600
     web_root = Path(__file__).resolve().parent / "web_admin"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -660,7 +660,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if not user:
                 write_json(self, 401, {"ok": False, "error": "admin login required"})
                 return
-            write_json(self, 200, {"ok": True, "user": user})
+            self._write_admin_json(200, {"ok": True, "user": user}, set_cookie_user=user)
             return
         user = self._require_admin()
         if not user:

@@ -148,6 +148,12 @@ class Worker:
         self._last_forwarded_legacy_ts = 0.0
         self._current_log_path: Optional[Path] = None
         self.current_job: Dict[str, Any] = {}
+        self._stop_event = threading.Event()
+        self._heartbeat_started = False
+        self._last_config_refresh_ts = 0
+        self._last_profile_sync_ts = 0
+        self._last_worker_error = ""
+        self._job_opened_profiles: Dict[int, Dict[str, str]] = {}
         self.audit = TaskAudit(
             config.get("task_dir", "automation/tasks"),
             config.get("log_dir", "automation/logs"),
@@ -192,6 +198,7 @@ class Worker:
                 raise RuntimeError(f"license validation failed: {result.message}")
             print(f"license ok: {result.message}")
 
+        self.start_heartbeat_thread()
         poll = int(self.config.get("poll_interval_seconds", 5))
         last_heartbeat = 0.0
         last_license_heartbeat = time.time()
@@ -225,12 +232,29 @@ class Worker:
                     job_id = job.get("id", "?")
                     print(f"worker job loop recovered after job {job_id} failed unexpectedly: {exc}")
                     try:
+                        self._last_worker_error = str(exc)[:500]
                         self.log_job(int(job_id), "error", f"Worker 捕获到未处理异常，已保持在线：{exc}")
                         self.fail(int(job_id), str(exc))
                     except Exception as report_exc:
                         print(f"failed to report unexpected job error: {report_exc}")
             else:
                 time.sleep(poll)
+
+    def start_heartbeat_thread(self) -> None:
+        if self._heartbeat_started:
+            return
+        self._heartbeat_started = True
+
+        def loop() -> None:
+            while not self._stop_event.is_set():
+                try:
+                    self.heartbeat()
+                except Exception as exc:
+                    self._last_worker_error = str(exc)[:500]
+                self._stop_event.wait(25)
+
+        thread = threading.Thread(target=loop, name="xbot-worker-heartbeat", daemon=True)
+        thread.start()
 
     def heartbeat(self) -> None:
         payload = {
@@ -245,19 +269,25 @@ class Worker:
                 "client_version": self.config.get("app_version", "unknown"),
                 "config_version": self.config.get("config_version"),
                 "current_job": self.current_job,
+                "last_config_refresh_at": self._last_config_refresh_ts,
+                "last_profile_sync_at": self._last_profile_sync_ts,
+                "last_worker_error": self._last_worker_error,
             },
         }
         try:
             api_json("POST", f"{self.central_api}/worker/heartbeat", self.token, payload)
         except Exception as exc:
             print(f"heartbeat failed: {exc}")
+            self._last_worker_error = f"heartbeat failed: {exc}"[:500]
 
     def apply_central_config(self, save_local: bool = True) -> None:
         try:
             response = api_json("GET", f"{self.central_api}/worker/config?node_id={self.node_id}", self.token)
             central_config = response.get("config") or {}
+            self._last_config_refresh_ts = int(time.time())
         except Exception as exc:
             print(f"worker config refresh failed: {exc}")
+            self._last_worker_error = f"worker config refresh failed: {exc}"[:500]
             return
         changed = False
         for key in (
@@ -303,6 +333,7 @@ class Worker:
                 print("updated local automation_config.yaml from central")
             except Exception as exc:
                 print(f"save central worker config failed: {exc}")
+                self._last_worker_error = f"save central worker config failed: {exc}"[:500]
 
     @staticmethod
     def normalize_search_keywords(value: Any) -> list[str]:
@@ -407,6 +438,7 @@ class Worker:
                 all_profiles.extend(profiles)
             except Exception as exc:
                 print(f"sync group {group_id} failed: {exc}")
+                self._last_worker_error = f"sync group {group_id} failed: {exc}"[:500]
         if not all_profiles:
             return
         payload = {
@@ -416,6 +448,7 @@ class Worker:
         }
         try:
             response = api_json("POST", f"{self.central_api}/accounts/sync", self.token, payload)
+            self._last_profile_sync_ts = int(time.time())
             print(
                 "synced profiles: "
                 f"{response.get('count', 0)} active, "
@@ -423,6 +456,7 @@ class Worker:
             )
         except Exception as exc:
             print(f"profile sync upload failed: {exc}")
+            self._last_worker_error = f"profile sync upload failed: {exc}"[:500]
 
     def refresh_assigned_sync_groups(self) -> None:
         # Central config is authoritative and is applied by apply_central_config().
@@ -464,6 +498,8 @@ class Worker:
 
     def handle_job(self, job: Dict[str, Any]) -> None:
         payload = job.setdefault("payload", {})
+        job_id_int = int(job["id"])
+        self._job_opened_profiles[job_id_int] = {}
         self.current_job = {
             "id": job.get("id"),
             "job_type": job.get("job_type"),
@@ -518,6 +554,7 @@ class Worker:
                 self.queue_pending_report("fail", job["id"], error=str(exc))
         finally:
             self.close_job_profiles(job)
+            self._job_opened_profiles.pop(job_id_int, None)
             self.lock.release(lock_path)
             self._current_log_path = None
             self.current_job = {}
@@ -630,6 +667,7 @@ class Worker:
         if not profile_text:
             raise RuntimeError("missing profile_id")
         opened = self.bit.open_profile(profile_text)
+        self.register_opened_profile(job_id, profile_text, "")
         if job_id:
             self.log_job(job_id, "log", f"已打开比特浏览器 profile={profile_text}")
         return opened
@@ -638,13 +676,29 @@ class Worker:
         profile_text = str(profile_id or "").strip()
         if not profile_text or not self.config.get("auto_close_profiles_after_job", True):
             return
-        try:
-            self.bit.close_profile(profile_text)
-            if job_id:
-                self.log_job(job_id, "log", f"任务结束，已自动关闭本次打开的比特浏览器 profile={profile_text}")
-        except Exception as exc:
-            if job_id:
-                self.log_job(job_id, "error", f"自动关闭比特浏览器 profile={profile_text} 失败：{exc}")
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                self.bit.close_profile(profile_text)
+                if job_id:
+                    self.log_job(job_id, "log", f"任务结束，已关闭 profile={profile_text}")
+                return
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.8 * (attempt + 1))
+        if job_id:
+            self.log_job(job_id, "error", f"关闭 profile={profile_text} 失败：{last_exc}")
+
+    def register_opened_profile(self, job_id: int, profile_id: Any, profile_name: Any = "") -> None:
+        if not job_id:
+            return
+        profile_text = str(profile_id or "").strip()
+        if not profile_text:
+            return
+        bucket = self._job_opened_profiles.setdefault(int(job_id), {})
+        if profile_text not in bucket:
+            bucket[profile_text] = str(profile_name or "")
+            self.log_job(int(job_id), "log", f"已登记本次打开 profile={profile_text}")
 
     def close_job_profiles(self, job: Dict[str, Any]) -> None:
         if not self.config.get("auto_close_profiles_after_job", True):
@@ -654,9 +708,12 @@ class Worker:
             return
         payload = job.get("payload") or {}
         profile_id = str(payload.get("profile_id") or payload.get("account_id") or "").strip()
-        if not profile_id:
-            return
-        self.close_bit_profile_after_job(profile_id, int(job.get("id") or 0))
+        job_id = int(job.get("id") or 0)
+        profile_ids = set(self._job_opened_profiles.get(job_id, {}).keys())
+        if profile_id:
+            profile_ids.add(profile_id)
+        for item in sorted(profile_ids):
+            self.close_bit_profile_after_job(item, job_id)
 
     @staticmethod
     def _extract_debug_port(opened_profile: Dict[str, Any]) -> Optional[int]:
@@ -819,6 +876,13 @@ class Worker:
             event = self.parse_legacy_event(line)
             if event.get("legacy_log"):
                 self.forward_legacy_log(job_id, event["legacy_log"])
+            if event.get("legacy_profile_opened"):
+                opened = event.get("legacy_profile_opened") or {}
+                self.register_opened_profile(
+                    job_id,
+                    opened.get("profile_id"),
+                    opened.get("profile_name") or "",
+                )
             if event.get("legacy_result"):
                 self.log_job(job_id, "log", "原脚本已返回最终结果，正在汇总。")
         timeout_timer.cancel()
@@ -846,6 +910,9 @@ class Worker:
         error = (stderr_text or "")[-4000:]
         legacy_result = self.extract_legacy_result(output)
         if legacy_result:
+            for item in legacy_result.get("opened_profiles", []) or []:
+                if isinstance(item, dict):
+                    self.register_opened_profile(job_id, item.get("profile_id"), item.get("profile_name") or "")
             for line in legacy_result.get("summary_logs", [])[-8:]:
                 self.log_job(job_id, "log", line)
             self.log_job(

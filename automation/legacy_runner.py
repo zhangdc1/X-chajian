@@ -156,6 +156,7 @@ class LegacyRunTracker:
         self.mode = mode
         self.lines: List[str] = []
         self.started_profiles = 0
+        self.opened_profiles: List[Dict[str, str]] = []
         self.entered_mode = False
         self.entered_business_loop = False
         self.completed = False
@@ -230,6 +231,7 @@ class LegacyRunTracker:
             "reason": reason,
             "mode": self.mode,
             "started_profiles": self.started_profiles,
+            "opened_profiles": self.opened_profiles,
             "entered_mode": self.entered_mode,
             "entered_business_loop": self.entered_business_loop,
             "completed": self.completed,
@@ -237,6 +239,25 @@ class LegacyRunTracker:
             "summary_logs": self.summary_lines(),
             "errors": self.errors,
         }
+
+    def record_profile_opened(self, profile_id: str, profile_name: str = "") -> None:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            return
+        if not any(item.get("profile_id") == profile_id for item in self.opened_profiles):
+            self.opened_profiles.append({"profile_id": profile_id, "profile_name": str(profile_name or "")})
+        print(
+            json.dumps(
+                {
+                    "legacy_profile_opened": {
+                        "profile_id": profile_id,
+                        "profile_name": str(profile_name or ""),
+                    }
+                },
+                ensure_ascii=True,
+            ),
+            flush=True,
+        )
 
     def summary_lines(self) -> List[str]:
         important = []
@@ -307,6 +328,15 @@ def run_legacy_mode(config: Dict[str, Any], log_file: str = "") -> Dict[str, Any
             encoding="utf-8",
         )
     newtkmain.logger.add(tracker, format="{time:HH:mm:ss} | {level} | {message}")
+    original_start_browser = getattr(newtkmain, "start_browser", None)
+    if callable(original_start_browser):
+        def tracked_start_browser(profile_id: str, profile_name: str, delay_seconds: float = 0):
+            result = original_start_browser(profile_id, profile_name, delay_seconds)
+            if isinstance(result, dict) and result.get("success"):
+                tracker.record_profile_opened(profile_id, profile_name)
+            return result
+
+        newtkmain.start_browser = tracked_start_browser
 
     newtkmain.RUN_MODE = mode
     newtkmain.BIT_API_URL = config.get("BIT_API_URL", "http://127.0.0.1:54345")

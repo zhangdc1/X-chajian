@@ -1,6 +1,8 @@
 import json
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -247,16 +249,120 @@ def now_ts() -> int:
     return int(time.time())
 
 
+class LockedConnection:
+    def __init__(self, conn: sqlite3.Connection, write_lock: threading.RLock):
+        self._conn = conn
+        self._write_lock = write_lock
+
+    def __enter__(self) -> "LockedConnection":
+        self._write_lock.acquire()
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        try:
+            return self._conn.__exit__(exc_type, exc, tb)
+        finally:
+            try:
+                self._conn.close()
+            finally:
+                self._write_lock.release()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        return self._execute_with_retry("execute", sql, parameters)
+
+    def executemany(self, sql: str, seq_of_parameters: Any, /) -> sqlite3.Cursor:
+        return self._execute_with_retry("executemany", sql, seq_of_parameters)
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        return self._execute_with_retry("executescript", sql_script)
+
+    def commit(self) -> None:
+        return self._run_locked(self._conn.commit)
+
+    def rollback(self) -> None:
+        return self._run_locked(self._conn.rollback)
+
+    def _execute_with_retry(self, method: str, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+        if not self._is_write_sql(sql):
+            if method == "execute":
+                return self._conn.execute(sql, parameters)
+            if method == "executemany":
+                return self._conn.executemany(sql, parameters)
+            return self._conn.executescript(sql)
+        if method == "execute":
+            return self._run_locked(lambda: self._conn.execute(sql, parameters))
+        if method == "executemany":
+            return self._run_locked(lambda: self._conn.executemany(sql, parameters))
+        return self._run_locked(lambda: self._conn.executescript(sql))
+
+    def _run_locked(self, fn: Any) -> Any:
+        with self._write_lock:
+            return self._retry_locked(fn)
+
+    @staticmethod
+    def _retry_locked(fn: Any) -> Any:
+        last_exc: Optional[sqlite3.OperationalError] = None
+        for attempt in range(5):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower():
+                    raise
+                last_exc = exc
+                time.sleep(0.15 * (attempt + 1))
+        raise RuntimeError("数据库繁忙，请稍后重试") from last_exc
+
+    @contextmanager
+    def write_transaction(self) -> Any:
+        with self._write_lock:
+            self._retry_locked(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+            try:
+                yield self
+            except Exception:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
+
+    @staticmethod
+    def _is_write_sql(sql: str) -> bool:
+        text = (sql or "").lstrip().split(None, 1)[0].upper() if (sql or "").strip() else ""
+        return text in {
+            "ALTER",
+            "BEGIN",
+            "COMMIT",
+            "CREATE",
+            "DELETE",
+            "DROP",
+            "INSERT",
+            "PRAGMA",
+            "REINDEX",
+            "REPLACE",
+            "ROLLBACK",
+            "UPDATE",
+            "VACUUM",
+        }
+
+
 class Storage:
+    _write_lock = threading.RLock()
+
     def __init__(self, db_path: str):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30)
+    def connect(self) -> LockedConnection:
+        conn = sqlite3.connect(self.db_path, timeout=60)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        return conn
+        with self._write_lock:
+            conn.execute("PRAGMA busy_timeout = 60000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        return LockedConnection(conn, self._write_lock)
 
     def init_db(self) -> None:
         with self.connect() as conn:
@@ -283,7 +389,6 @@ class Storage:
         ts = now_ts()
         today_start = ts - (ts % 86400)
         offline_cutoff = ts - int(offline_after_seconds)
-        self.finalize_expired_leases(grace_seconds=offline_after_seconds * 2)
         with self.connect() as conn:
             worker_rows = conn.execute("SELECT * FROM worker_nodes ORDER BY last_seen DESC LIMIT 100").fetchall()
             job_status_rows = conn.execute(
@@ -1923,6 +2028,34 @@ class Storage:
                 """,
                 (node_id, effective_label, ts, status, json.dumps(meta, ensure_ascii=False)),
             )
+            current_job = meta.get("current_job") or {}
+            try:
+                job_id = int(current_job.get("id") or 0)
+            except (TypeError, ValueError):
+                job_id = 0
+            if job_id:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET lease_until = CASE
+                            WHEN status IN ('leased', 'cancel_requested')
+                            THEN MAX(COALESCE(lease_until, 0), ?)
+                            ELSE lease_until
+                        END,
+                        leased_by = CASE
+                            WHEN status IN ('leased', 'cancel_requested')
+                            THEN COALESCE(leased_by, ?)
+                            ELSE leased_by
+                        END,
+                        updated_at = CASE
+                            WHEN status IN ('leased', 'cancel_requested')
+                            THEN ?
+                            ELSE updated_at
+                        END
+                    WHERE id = ?
+                    """,
+                    (ts + 300, node_id, ts, job_id),
+                )
 
     def list_workers(self, limit: int = 100, offline_after_seconds: int = 90) -> list[Dict[str, Any]]:
         ts = now_ts()
