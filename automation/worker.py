@@ -529,10 +529,14 @@ class Worker:
             self.audit.finish_job(job, "failed", error=error)
             self._current_log_path = None
             self.fail(job["id"], error)
+            self._job_opened_profiles.pop(job_id_int, None)
             return
+        profiles_closed = False
         try:
             result = self.execute(job)
             result.setdefault("local_log_path", str(log_path))
+            self.close_job_profiles(job)
+            profiles_closed = True
             self.log_job(job["id"], "running", f"任务执行完成，准备回传结果：{result.get('status', 'ok')}")
             self.audit.finish_job(job, "completed", result=result)
             if not self.report_job_status("complete", job["id"], result=result):
@@ -545,15 +549,20 @@ class Worker:
         except Exception as exc:
             self.log_job(job["id"], "error", f"任务执行失败：{exc}")
             if isinstance(exc, JobPreempted):
+                self.close_job_profiles(job)
+                profiles_closed = True
                 self.audit.finish_job(job, "preempted", error=str(exc))
                 if not self.report_job_status("preempt", job["id"], error=str(exc)):
                     self.queue_pending_report("preempt", job["id"], error=str(exc))
                 return
+            self.close_job_profiles(job)
+            profiles_closed = True
             self.audit.finish_job(job, "failed", error=str(exc))
             if not self.report_job_status("fail", job["id"], error=str(exc)):
                 self.queue_pending_report("fail", job["id"], error=str(exc))
         finally:
-            self.close_job_profiles(job)
+            if not profiles_closed:
+                self.close_job_profiles(job)
             self._job_opened_profiles.pop(job_id_int, None)
             self.lock.release(lock_path)
             self._current_log_path = None
@@ -712,6 +721,11 @@ class Worker:
         profile_ids = set(self._job_opened_profiles.get(job_id, {}).keys())
         if profile_id:
             profile_ids.add(profile_id)
+        if job_id:
+            if profile_ids:
+                self.log_job(job_id, "log", f"本任务共登记打开窗口 {len(profile_ids)} 个，开始自动关闭。")
+            else:
+                self.log_job(job_id, "log", "未登记到本次打开 profile，跳过自动关窗。")
         for item in sorted(profile_ids):
             self.close_bit_profile_after_job(item, job_id)
 

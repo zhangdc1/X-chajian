@@ -549,15 +549,16 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if not group_id or mode not in {1, 2, 3}:
                 write_json(self, 400, {"ok": False, "error": "missing group_id or invalid mode"})
                 return
-            job_ids = self.storage.create_legacy_mode_jobs(
+            created = self.storage.create_legacy_mode_jobs(
                 group_id=group_id,
                 mode=mode,
                 payload=payload,
                 target_node_id=payload.get("target_node_id"),
                 limit=int(payload.get("limit", 500)),
             )
+            job_ids = [int(x) for x in created.get("job_ids", [])]
             preempted = self.storage.create_mode2_preemptions(job_ids) if mode == 2 else {}
-            write_json(self, 201, {"ok": True, "job_ids": job_ids, "count": len(job_ids), **preempted})
+            write_json(self, 201, {"ok": True, "count": len(job_ids), **created, **preempted})
             return
         if parsed.path.startswith("/plans/") and parsed.path.endswith("/approve"):
             try:

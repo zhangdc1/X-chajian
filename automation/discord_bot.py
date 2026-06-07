@@ -660,8 +660,20 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             preempted = int(data.get("preempted") or 0)
             if preempted:
                 extra = f"\n已抢占当前任务 {preempted} 个，抢占任务已重新排队。"
+        nodes = data.get("nodes") or []
+        node_parts = []
+        for item in nodes:
+            node_id = item.get("node_id") or "-"
+            account_count = int(item.get("account_count") or 0)
+            window_count = int(item.get("window_count") or 0)
+            node_parts.append(f"{node_id}(账号{account_count}/窗口{window_count})")
+        node_summary = "、".join(node_parts) or "-"
+        account_count = int(data.get("account_count") or 0)
+        window_count_total = int(data.get("window_count_total") or 0)
         return (
             f"已创建模式{mode}任务 {len(job_ids)} 个。\n"
+            f"分组账号数: {account_count} | 预计拉起窗口: {window_count_total}\n"
+            f"涉及电脑: {node_summary}\n"
             f"任务ID: {', '.join(str(x) for x in job_ids)}{extra}\n"
             f"后续按分组汇总汇报，不再逐账号刷屏。"
         ), [], {"kind": "mode", "title": f"模式{mode} {group_id}", "job_ids": job_ids, "group_id": group_id, "mode": mode, "preempted": int(data.get("preempted") or 0)}

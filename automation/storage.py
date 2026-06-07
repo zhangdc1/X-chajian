@@ -1221,6 +1221,22 @@ class Storage:
             (alias, group_id, ts, ts),
         )
 
+    def _group_has_active_alias(self, conn: sqlite3.Connection, group_id: str) -> bool:
+        group_id = (group_id or "").strip()
+        if not group_id:
+            return False
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM group_aliases
+            WHERE group_id = ?
+              AND status = 'active'
+            LIMIT 1
+            """,
+            (group_id,),
+        ).fetchone()
+        return row is not None
+
     def _dedupe_active_group_aliases(self, conn: sqlite3.Connection) -> None:
         ts = now_ts()
         conn.execute(
@@ -2159,11 +2175,15 @@ class Storage:
                     or (account.get("meta") or {}).get("group_name")
                 )
                 if group_name:
-                    self._set_group_alias(
-                        conn,
-                        str(group_name),
-                        group_id,
-                    )
+                    # BitBrowser groupName is only a bootstrap alias. Once an
+                    # admin has bound/renamed a group, account sync must not
+                    # overwrite that central alias with an old client name.
+                    if group_id and not self._group_has_active_alias(conn, group_id):
+                        self._set_group_alias(
+                            conn,
+                            str(group_name),
+                            group_id,
+                        )
             deactivated = 0
             cancelled_jobs = 0
             cancelled_tasks = 0
@@ -2467,7 +2487,7 @@ class Storage:
         payload: Dict[str, Any],
         target_node_id: Optional[str] = None,
         limit: int = 500,
-    ) -> list[int]:
+    ) -> Dict[str, Any]:
         from automation.job_types import JOB_LEGACY_MODE_RUN
 
         resolved_group_id = self.resolve_group_id(group_id)
@@ -2476,14 +2496,25 @@ class Storage:
         if target_node_id:
             node_ids = [target_node_id]
         job_ids = []
+        node_summaries: list[Dict[str, Any]] = []
+        explicit_window_count = payload.get("window_count")
         for node_id in node_ids:
             job_payload = dict(payload)
+            node_account_count = sum(1 for account in accounts if account.get("node_id") == node_id)
+            if explicit_window_count is None:
+                window_count = max(1, node_account_count)
+            else:
+                try:
+                    window_count = max(1, int(explicit_window_count))
+                except (TypeError, ValueError):
+                    window_count = max(1, node_account_count)
             job_payload.update(
                 {
                     "mode": mode,
                     "group_id": resolved_group_id or group_id,
                     "target_node_id": node_id,
-                    "account_count": sum(1 for account in accounts if account.get("node_id") == node_id),
+                    "account_count": node_account_count,
+                    "window_count": window_count,
                 }
             )
             job_id = self.create_job(
@@ -2492,7 +2523,20 @@ class Storage:
                 target_node_id=node_id,
             )
             job_ids.append(job_id)
-        return job_ids
+            node_summaries.append(
+                {
+                    "node_id": node_id,
+                    "account_count": node_account_count,
+                    "window_count": window_count,
+                    "job_id": job_id,
+                }
+            )
+        return {
+            "job_ids": job_ids,
+            "nodes": node_summaries,
+            "account_count": sum(int(item.get("account_count") or 0) for item in node_summaries),
+            "window_count_total": sum(int(item.get("window_count") or 0) for item in node_summaries),
+        }
 
     def create_mode2_preemptions(self, mode2_job_ids: list[int]) -> Dict[str, Any]:
         if not mode2_job_ids:
