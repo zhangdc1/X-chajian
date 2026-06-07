@@ -21,6 +21,7 @@ DEFAULT_MODEL_CONFIG = {
         "auto_publish": True,
         "save_drafts": True,
         "fallback_to_static": True,
+        "fallback_to_comment_library": True,
         "output_path": "automation/output/comment_drafts.jsonl",
     },
 }
@@ -443,6 +444,7 @@ class Storage:
             "central_token": DEFAULT_CENTRAL_TOKEN,
             "enable_grok_browser": True,
             "open_gui_for_legacy": False,
+            "auto_close_profiles_after_job": True,
             "sync_profiles_interval_seconds": 30,
             "worker_config_interval_seconds": 30,
             "stale_job_grace_seconds": 3600,
@@ -666,6 +668,7 @@ class Storage:
             "label",
             "enable_grok_browser",
             "open_gui_for_legacy",
+            "auto_close_profiles_after_job",
             "sync_profiles_interval_seconds",
             "worker_config_interval_seconds",
             "stale_job_grace_seconds",
@@ -700,6 +703,7 @@ class Storage:
             "central_token",
             "enable_grok_browser",
             "open_gui_for_legacy",
+            "auto_close_profiles_after_job",
             "sync_profiles_interval_seconds",
             "worker_config_interval_seconds",
             "stale_job_grace_seconds",
@@ -730,6 +734,7 @@ class Storage:
     def _merge_model_config(current: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(DEFAULT_MODEL_CONFIG)
         merged.update(current or {})
+        merged["smart_comment"] = Storage._normalize_smart_comment_config(merged.get("smart_comment") or {})
         for key, value in (updates or {}).items():
             if key == "api_key" and (not str(value or "").strip() or "***" in str(value) or "..." in str(value)):
                 continue
@@ -737,10 +742,25 @@ class Storage:
                 smart_current = dict(merged.get("smart_comment") or DEFAULT_MODEL_CONFIG.get("smart_comment") or {})
                 for smart_key, smart_value in value.items():
                     smart_current[smart_key] = smart_value
-                merged["smart_comment"] = smart_current
+                merged["smart_comment"] = Storage._normalize_smart_comment_config(smart_current)
                 continue
             merged[key] = value
+        merged["smart_comment"] = Storage._normalize_smart_comment_config(merged.get("smart_comment") or {})
         return merged
+
+    @staticmethod
+    def _normalize_smart_comment_config(value: Dict[str, Any]) -> Dict[str, Any]:
+        smart = dict(DEFAULT_MODEL_CONFIG.get("smart_comment") or {})
+        smart.update(value or {})
+        if "fallback_to_comment_library" in value:
+            fallback = bool(value.get("fallback_to_comment_library"))
+        elif "fallback_to_static" in value:
+            fallback = bool(value.get("fallback_to_static"))
+        else:
+            fallback = bool(smart.get("fallback_to_comment_library", smart.get("fallback_to_static", True)))
+        smart["fallback_to_comment_library"] = fallback
+        smart["fallback_to_static"] = fallback
+        return smart
 
     def resolve_model_config_target_nodes(self, scope: str, node_ids: Any = None, group_ids: Any = None) -> list[str]:
         scope = str(scope or "all").strip().lower()

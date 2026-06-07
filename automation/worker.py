@@ -45,6 +45,7 @@ DEFAULT_MODEL_CONFIG = {
         "auto_publish": True,
         "save_drafts": True,
         "fallback_to_static": True,
+        "fallback_to_comment_library": True,
         "output_path": "automation/output/comment_drafts.jsonl",
     },
 }
@@ -53,6 +54,7 @@ DEFAULT_WORKER_CONFIG = {
     "central_token": DEFAULT_CENTRAL_TOKEN,
     "enable_grok_browser": True,
     "open_gui_for_legacy": False,
+    "auto_close_profiles_after_job": True,
     "sync_profiles_interval_seconds": 30,
     "worker_config_interval_seconds": 30,
     "stale_job_grace_seconds": 3600,
@@ -262,6 +264,7 @@ class Worker:
             "label",
             "enable_grok_browser",
             "open_gui_for_legacy",
+            "auto_close_profiles_after_job",
             "sync_profiles_interval_seconds",
             "worker_config_interval_seconds",
             "stale_job_grace_seconds",
@@ -353,6 +356,7 @@ class Worker:
                 current = {}
         merged = dict(current)
         merged.update(model_config)
+        merged["smart_comment"] = self.normalize_smart_comment_config(merged.get("smart_comment") or {})
         if merged == current:
             return
         try:
@@ -361,6 +365,23 @@ class Worker:
             print("updated model_config.yaml from central")
         except Exception as exc:
             print(f"save model_config.yaml failed: {exc}")
+
+    @staticmethod
+    def normalize_smart_comment_config(value: Dict[str, Any]) -> Dict[str, Any]:
+        smart = dict(value or {})
+        if "fallback_to_comment_library" in smart:
+            fallback = bool(smart.get("fallback_to_comment_library"))
+        elif "fallback_to_static" in smart:
+            fallback = bool(smart.get("fallback_to_static"))
+        else:
+            fallback = True
+        smart["fallback_to_comment_library"] = fallback
+        smart["fallback_to_static"] = fallback
+        smart.setdefault("enabled", True)
+        smart.setdefault("auto_publish", True)
+        smart.setdefault("save_drafts", True)
+        smart.setdefault("output_path", "automation/output/comment_drafts.jsonl")
+        return smart
 
     def check_license_heartbeat(self) -> None:
         max_failures = int(self.config.get("license_max_failures", 3) or 3)
@@ -496,6 +517,7 @@ class Worker:
             if not self.report_job_status("fail", job["id"], error=str(exc)):
                 self.queue_pending_report("fail", job["id"], error=str(exc))
         finally:
+            self.close_job_profiles(job)
             self.lock.release(lock_path)
             self._current_log_path = None
             self.current_job = {}
@@ -534,7 +556,7 @@ class Worker:
                 "running",
                 f"将打开比特浏览器 profile={profile_id} 并进入 X Grok",
             )
-            opened = self.bit.open_profile(str(profile_id))
+            opened = self.open_bit_profile(profile_id, int(payload.get("_job_id", 0) or 0))
             debug_port = self._extract_debug_port(opened)
             if not debug_port:
                 raise RuntimeError(f"Bit Browser did not return a debug port: {opened}")
@@ -576,7 +598,7 @@ class Worker:
                 "running",
                 f"将打开比特浏览器 profile={profile_id} 并进入 X Grok 执行账号评分",
             )
-            opened = self.bit.open_profile(str(profile_id))
+            opened = self.open_bit_profile(profile_id, int(payload.get("_job_id", 0) or 0))
             debug_port = self._extract_debug_port(opened)
             if not debug_port:
                 raise RuntimeError(f"Bit Browser did not return a debug port: {opened}")
@@ -602,6 +624,39 @@ class Worker:
             "prompt": prompt,
             "parsed_plan": parse_score_plan("", period=period, seed_extra=str(profile_id or account_id)),
         }
+
+    def open_bit_profile(self, profile_id: Any, job_id: int = 0) -> Dict[str, Any]:
+        profile_text = str(profile_id or "").strip()
+        if not profile_text:
+            raise RuntimeError("missing profile_id")
+        opened = self.bit.open_profile(profile_text)
+        if job_id:
+            self.log_job(job_id, "log", f"已打开比特浏览器 profile={profile_text}")
+        return opened
+
+    def close_bit_profile_after_job(self, profile_id: Any, job_id: int = 0) -> None:
+        profile_text = str(profile_id or "").strip()
+        if not profile_text or not self.config.get("auto_close_profiles_after_job", True):
+            return
+        try:
+            self.bit.close_profile(profile_text)
+            if job_id:
+                self.log_job(job_id, "log", f"任务结束，已自动关闭本次打开的比特浏览器 profile={profile_text}")
+        except Exception as exc:
+            if job_id:
+                self.log_job(job_id, "error", f"自动关闭比特浏览器 profile={profile_text} 失败：{exc}")
+
+    def close_job_profiles(self, job: Dict[str, Any]) -> None:
+        if not self.config.get("auto_close_profiles_after_job", True):
+            return
+        job_type = str(job.get("job_type") or "")
+        if job_type not in {JOB_GENERATE_GROK_PLAN, JOB_SCORE_GROK_PLAN, JOB_LEGACY_MODE_RUN}:
+            return
+        payload = job.get("payload") or {}
+        profile_id = str(payload.get("profile_id") or payload.get("account_id") or "").strip()
+        if not profile_id:
+            return
+        self.close_bit_profile_after_job(profile_id, int(job.get("id") or 0))
 
     @staticmethod
     def _extract_debug_port(opened_profile: Dict[str, Any]) -> Optional[int]:
@@ -674,6 +729,7 @@ class Worker:
                 overrides["FARMING_CONFIG"] = farm
                 payload["config_overrides"] = overrides
         job_id = int(payload.get("_job_id", 0) or 0)
+        explicit_profile_id = str(payload.get("profile_id") or payload.get("account_id") or "").strip()
         timeout_seconds = int(self.config.get("legacy_job_timeout_seconds", 7200))
         self.log_job(
             job_id,

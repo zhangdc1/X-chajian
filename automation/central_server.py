@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from automation.job_types import SAFE_JOB_TYPES
+from automation.model_client import OpenAICompatibleClient
 from automation.plan_parser import build_tasks_from_plan
 from automation.storage import Storage
 
@@ -892,6 +893,67 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 )
                 self._audit(user, "apply_model_config", "setting", "model_config", {"result": result})
                 write_json(self, 200, {"ok": True, **result})
+                return
+            if path == "/admin/api/model-config/test":
+                saved = (self.storage.get_worker_default_config(mask_secrets=False).get("model_config") or {})
+                submitted = payload.get("model_config") or {}
+                config = self.storage._merge_model_config(saved, submitted)
+                config["timeout_seconds"] = int(payload.get("timeout_seconds") or config.get("timeout_seconds") or 20)
+                client = OpenAICompatibleClient(config)
+                smart = config.get("smart_comment") or {}
+                diagnostics = {
+                    "model_enabled": bool(config.get("enabled")),
+                    "smart_comment_enabled": bool(smart.get("enabled", False)),
+                    "base_url_ok": bool(str(config.get("base_url") or "").strip()),
+                    "api_key_ok": bool(str(config.get("api_key") or "").strip()),
+                    "model_ok": bool(str(config.get("model") or "").strip()),
+                    "base_url": str(config.get("base_url") or "").rstrip("/"),
+                    "model": str(config.get("model") or ""),
+                    "fallback_to_comment_library": bool(
+                        smart.get("fallback_to_comment_library", smart.get("fallback_to_static", True))
+                    ),
+                }
+                started = time.time()
+                try:
+                    text = client.chat_text(
+                        [
+                            {"role": "system", "content": "你是模型连通性测试助手，只输出一句简短中文。"},
+                            {"role": "user", "content": "请回复：模型连接正常"},
+                        ],
+                        temperature=0,
+                    )
+                    self._audit(user, "test_model_config", "setting", "model_config", {"ok": True, "model": diagnostics["model"]})
+                    write_json(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "success": True,
+                            "diagnostics": diagnostics,
+                            "reply": str(text or "")[:300],
+                            "duration_ms": int((time.time() - started) * 1000),
+                        },
+                    )
+                except Exception as exc:
+                    self._audit(
+                        user,
+                        "test_model_config",
+                        "setting",
+                        "model_config",
+                        {"ok": False, "model": diagnostics["model"], "error": str(exc)[:500]},
+                        ok=False,
+                    )
+                    write_json(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "success": False,
+                            "diagnostics": diagnostics,
+                            "error": str(exc),
+                            "duration_ms": int((time.time() - started) * 1000),
+                        },
+                    )
                 return
             if path == "/admin/api/score-fallback-config":
                 config = self.storage.update_score_fallback_config(payload)

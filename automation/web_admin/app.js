@@ -153,6 +153,98 @@ function showDetail(title, data) {
   showHtmlDetail(title, `<pre>${esc(typeof data === "string" ? data : JSON.stringify(data, null, 2))}</pre>`);
 }
 
+function rawDetails(data) {
+  return `<details class="raw-detail"><summary>查看原始数据</summary><pre>${esc(JSON.stringify(data, null, 2))}</pre></details>`;
+}
+
+function kvTable(items) {
+  const rows = items.map(([label, value]) => `<tr><th>${esc(label)}</th><td class="wrap">${value}</td></tr>`);
+  return table([th("字段"), th("内容")], rows, "暂无详情");
+}
+
+function renderPayloadSummary(payload = {}) {
+  const rows = [
+    ["模式", esc(payload.mode || "-")],
+    ["账号", esc(payload.account_id || payload.profile_id || "-")],
+    ["分组", esc(payload.group_id || "-")],
+    ["周期", esc(payload.period || "-")],
+    ["执行时间", esc(payload.run_at ? fmtTime(payload.run_at) : "-")],
+    ["本地日志", esc(payload._local_log_path || payload.local_log_path || "-")],
+  ].map(([label, value]) => `<tr><td>${label}</td><td class="wrap">${value}</td></tr>`);
+  return table([th("字段"), th("值")], rows, "暂无参数");
+}
+
+function renderJobDetail(data) {
+  const job = data.job || {};
+  const runs = data.runs || [];
+  const info = kvTable([
+    ["任务 ID", esc(job.id || "-")],
+    ["任务类型", esc(job.job_type || "-")],
+    ["任务来源", esc(job.source_label || "-")],
+    ["状态", statusPill(job.status)],
+    ["优先级", `${esc(job.priority || 10)}${Number(job.priority || 0) >= 100 ? ' <span class="pill blue">最高优先级</span>' : ""}`],
+    ["电脑", esc(job.leased_by || job.target_node_id || "-")],
+    ["创建时间", esc(fmtTime(job.created_at))],
+    ["更新时间", esc(fmtTime(job.updated_at))],
+    ["租约到期", esc(fmtTime(job.lease_until))],
+    ["抢占关系", relationText(job)],
+    ["错误", esc(job.error || "-")],
+  ]);
+  const runRows = runs.map(r => `<tr>
+    <td>${r.id}</td>
+    <td>${esc(r.node_id || "-")}</td>
+    <td>${statusPill(r.status)}</td>
+    <td class="wrap">${esc(r.message || "")}</td>
+    <td>${fmtTime(r.created_at)}</td>
+  </tr>`);
+  return `
+    <div class="detail-section"><h3>任务摘要</h3>${info}</div>
+    <div class="detail-section"><h3>任务参数</h3>${renderPayloadSummary(job.payload || {})}</div>
+    <div class="detail-section"><h3>日志记录</h3>${table([th("ID"), th("电脑"), th("状态"), th("内容"), th("时间")], runRows, "暂无日志")}</div>
+    ${rawDetails(data)}
+  `;
+}
+
+function renderScheduleTaskDetail(task) {
+  const info = kvTable([
+    ["调度 ID", esc(task.id || "-")],
+    ["计划 ID", esc(task.plan_id || "-")],
+    ["关联 job", esc(task.job_id || "-")],
+    ["电脑", esc(task.node_id || "-")],
+    ["分组", esc(task.group_id || "-")],
+    ["账号", esc(task.account_display || task.account_name || task.account_id || "-")],
+    ["模式", esc((task.payload || {}).mode || "-")],
+    ["状态", statusPill(task.status)],
+    ["执行时间", esc(fmtTime(task.run_at))],
+    ["创建时间", esc(fmtTime(task.created_at))],
+    ["更新时间", esc(fmtTime(task.updated_at))],
+    ["错误", esc(task.last_error || "-")],
+  ]);
+  return `
+    <div class="detail-section"><h3>调度摘要</h3>${info}</div>
+    <div class="detail-section"><h3>执行参数</h3>${renderPayloadSummary(task.payload || {})}</div>
+    ${rawDetails(task)}
+  `;
+}
+
+function renderTimeline(events) {
+  const rows = (events || []).map(e => `<tr>
+    <td>${esc(e.kind === "job" ? "任务" : "调度")}</td>
+    <td>${esc(e.id || "-")}</td>
+    <td>${esc(e.title || "-")}</td>
+    <td>${statusPill(e.status)}</td>
+    <td>${fmtTime(e.time)}</td>
+    <td class="wrap">${esc(e.error || "")}</td>
+  </tr>`);
+  return `
+    <div class="detail-section">
+      <h3>账号时间线</h3>
+      ${table([th("类型"), th("ID"), th("标题"), th("状态"), th("时间"), th("错误")], rows, "暂无时间线")}
+    </div>
+    ${rawDetails(events || [])}
+  `;
+}
+
 async function refreshCurrent() {
   const btn = $("refreshBtn");
   btn.disabled = true;
@@ -449,7 +541,7 @@ async function loadSchedule() {
       <td>plan=${esc(t.plan_id || "-")}<br>job=${esc(t.job_id || "-")}</td>
       <td class="wrap">${esc(t.last_error || "")}</td>
       <td>
-        <button class="ghost" onclick='showDetail("调度任务 ${t.id}", ${JSON.stringify(t).replaceAll("'", "&#39;")})'>详情</button>
+        <button class="ghost" onclick='scheduleTaskDetail(${JSON.stringify(t).replaceAll("'", "&#39;")})'>详情</button>
         <button class="ghost" onclick="taskAction(${t.id}, 'pause')">暂停</button>
         <button class="ghost" onclick="taskAction(${t.id}, 'resume')">恢复</button>
         <button class="ghost danger" onclick="taskAction(${t.id}, 'cancel')">取消</button>
@@ -500,6 +592,7 @@ function renderSettings(settings) {
       <tr><th>Base URL</th><td><input id="modelBaseUrl" value="${esc(model.base_url || "")}"></td></tr>
       <tr><th>API Key</th><td><input id="modelApiKey" value="${esc(model.api_key || "")}" placeholder="留空或保留掩码则不替换"></td></tr>
       <tr><th>模型名称</th><td><input id="modelName" value="${esc(model.model || "")}"></td></tr>
+      <tr><th>连通性测试</th><td><button id="testModelBtn" type="button" class="ghost">测试模型连通性</button><div id="modelTestResult" class="small muted"></div></td></tr>
       <tr><th>下发范围</th><td>
         <select id="modelApplyScope">
           <option value="all">全部电脑</option>
@@ -552,12 +645,16 @@ async function setAccountStatus(profileId, status) {
 
 async function accountTimeline(profileId) {
   const data = await api(`/admin/api/accounts/${encodeURIComponent(profileId)}/timeline`);
-  showDetail(`账号时间线 ${profileId}`, data.timeline);
+  showHtmlDetail(`账号时间线 ${profileId}`, renderTimeline(data.timeline || []));
 }
 
 async function jobDetail(jobId) {
   const data = await api(`/admin/api/jobs/${jobId}`);
-  showDetail(`任务 ${jobId}`, data);
+  showHtmlDetail(`任务 ${jobId}`, renderJobDetail(data));
+}
+
+function scheduleTaskDetail(task) {
+  showHtmlDetail(`调度任务 ${task.id}`, renderScheduleTaskDetail(task));
 }
 
 async function cancelJob(jobId) {
@@ -679,23 +776,7 @@ async function saveFallbackConfig() {
 }
 
 async function saveModelConfig() {
-  const keyText = $("modelApiKey").value.trim();
-  const model_config = {
-    enabled: $("modelEnabled").checked,
-    provider: "openai_compatible",
-    base_url: $("modelBaseUrl").value.trim(),
-    model: $("modelName").value.trim(),
-    smart_comment: {
-      enabled: $("smartCommentEnabled").checked,
-      auto_publish: true,
-      save_drafts: true,
-      fallback_to_static: true,
-      output_path: "automation/output/comment_drafts.jsonl",
-    },
-  };
-  if (keyText && !keyText.includes("***") && !keyText.includes("...")) {
-    model_config.api_key = keyText;
-  }
+  const model_config = collectModelConfigFromForm();
   const scope = $("modelApplyScope").value;
   const node_ids = Array.from($("modelNodeIds").selectedOptions).map(opt => opt.value);
   const group_ids = Array.from($("modelGroupIds").selectedOptions).map(opt => opt.value);
@@ -707,6 +788,50 @@ async function saveModelConfig() {
   });
   alert(scope === "all" ? `模型配置已保存并下发到 ${result.count || 0} 台已知电脑` : `模型配置已下发到 ${result.count || 0} 台电脑`);
   await loadAudit();
+}
+
+function collectModelConfigFromForm() {
+  const keyText = $("modelApiKey").value.trim();
+  const model_config = {
+    enabled: $("modelEnabled").checked,
+    provider: "openai_compatible",
+    base_url: $("modelBaseUrl").value.trim(),
+    model: $("modelName").value.trim(),
+    smart_comment: {
+      enabled: $("smartCommentEnabled").checked,
+      auto_publish: true,
+      save_drafts: true,
+      fallback_to_static: true,
+      fallback_to_comment_library: true,
+      output_path: "automation/output/comment_drafts.jsonl",
+    },
+  };
+  if (keyText && !keyText.includes("***") && !keyText.includes("...")) {
+    model_config.api_key = keyText;
+  }
+  return model_config;
+}
+
+async function testModelConfig() {
+  const resultBox = $("modelTestResult");
+  const btn = $("testModelBtn");
+  if (!resultBox || !btn) return;
+  btn.disabled = true;
+  resultBox.textContent = "正在测试模型连通性...";
+  try {
+    const data = await api("/admin/api/model-config/test", {
+      method: "POST",
+      body: JSON.stringify({ model_config: collectModelConfigFromForm() }),
+    });
+    const d = data.diagnostics || {};
+    resultBox.innerHTML = data.success
+      ? `<span class="pill ok">连接成功</span> 用时 ${esc(data.duration_ms || 0)}ms；模型=${esc(d.model || "-")}；智能评论=${d.smart_comment_enabled ? "开启" : "关闭"}；回复：${esc(data.reply || "")}`
+      : `<span class="pill bad">连接失败</span> 模型启用=${d.model_enabled ? "是" : "否"}；智能评论=${d.smart_comment_enabled ? "开启" : "关闭"}；URL=${d.base_url_ok ? "完整" : "缺失"}；Key=${d.api_key_ok ? "已配置" : "缺失"}；模型名=${d.model_ok ? "完整" : "缺失"}；错误：${esc(data.error || "未知错误")}`;
+  } catch (err) {
+    resultBox.innerHTML = `<span class="pill bad">测试失败</span> ${esc(err.message)}`;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function saveSearchKeywords() {
@@ -796,6 +921,11 @@ document.addEventListener("DOMContentLoaded", () => {
   $("resetPromptBtn").addEventListener("click", resetPrompt);
   $("saveFallbackBtn").addEventListener("click", saveFallbackConfig);
   $("saveModelBtn").addEventListener("click", saveModelConfig);
+  document.addEventListener("click", event => {
+    if (event.target && event.target.id === "testModelBtn") {
+      testModelConfig();
+    }
+  });
   $("saveSearchKeywordsBtn").addEventListener("click", saveSearchKeywords);
   checkSession().catch(err => console.error(err));
 });
@@ -806,6 +936,7 @@ window.loadAccounts = loadAccounts;
 window.setAccountStatus = setAccountStatus;
 window.accountTimeline = accountTimeline;
 window.jobDetail = jobDetail;
+window.scheduleTaskDetail = scheduleTaskDetail;
 window.cancelJob = cancelJob;
 window.planDetail = planDetail;
 window.planAction = planAction;

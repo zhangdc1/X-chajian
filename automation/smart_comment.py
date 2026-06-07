@@ -15,11 +15,13 @@ DEFAULT_OUTPUT = PROJECT_ROOT / "automation" / "output" / "comment_drafts.jsonl"
 def smart_comment_config() -> Dict[str, Any]:
     config = load_model_config()
     smart = config.get("smart_comment") or {}
+    fallback_enabled = bool(smart.get("fallback_to_comment_library", smart.get("fallback_to_static", True)))
     return {
         "enabled": bool(smart.get("enabled", False)),
         "auto_publish": bool(smart.get("auto_publish", True)),
         "save_drafts": bool(smart.get("save_drafts", True)),
-        "fallback_to_comment_library": bool(smart.get("fallback_to_comment_library", True)),
+        "fallback_to_comment_library": fallback_enabled,
+        "fallback_to_static": fallback_enabled,
         "output_path": smart.get("output_path") or str(DEFAULT_OUTPUT),
     }
 
@@ -48,11 +50,13 @@ def generate_comment(
     if not cfg["enabled"]:
         record["generated_comment"] = fallback_text
         record["status"] = "fallback_used"
-        record["error"] = "smart_comment disabled"
+        record["error"] = "智能评论关闭，已使用评论库兜底" if fallback_text else "智能评论关闭，且没有可用评论库兜底"
         return record
 
     client = OpenAICompatibleClient.from_file()
     try:
+        if not client.ready():
+            raise RuntimeError("模型未启用或配置不完整，无法生成智能评论")
         comment = client.chat_text(
             [
                 {
@@ -81,6 +85,7 @@ def generate_comment(
         if cfg["fallback_to_comment_library"] and fallback_text:
             record["generated_comment"] = fallback_text
             record["status"] = "fallback_used"
+            record["error"] = f"智能评论失败，已使用评论库兜底：{exc}"
             return record
         raise
 

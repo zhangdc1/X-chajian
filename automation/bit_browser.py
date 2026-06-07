@@ -36,6 +36,12 @@ class BitBrowserClient:
             raise RuntimeError(f"Bit Browser open failed: {response}")
         return response.get("data", {}) or {}
 
+    def close_profile(self, profile_id: str) -> Dict[str, Any]:
+        response = self._post("/browser/close", {"id": profile_id})
+        if not response.get("success"):
+            raise RuntimeError(f"Bit Browser close failed: {response}")
+        return response.get("data", {}) or {}
+
     def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(

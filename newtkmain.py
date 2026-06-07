@@ -113,9 +113,13 @@ def build_reply_text(tweet, page, p_name="", fallback_url="", fallback_index=Non
                 fallback_pool=fallback_pool,
             )
             audit_comment(record, record.get("status") or "generated")
+            if record.get("status") == "generated":
+                logger.info(f"[{p_name}] 智能评论生成成功：{record.get('generated_comment', '')[:40]}")
+            elif record.get("status") == "fallback_used":
+                logger.warning(f"[{p_name}] {record.get('error') or '智能评论未生成，已使用评论库兜底'}")
             return record.get("generated_comment") or next(iter(fallback_pool)), record
         except Exception as exc:
-            logger.warning(f"[{p_name}] 智能评论生成失败，使用评论库回退: {exc}")
+            logger.warning(f"[{p_name}] 智能评论生成失败，使用评论库兜底: {exc}")
     text = next(iter(fallback_pool))
     record = {
         "profile": p_name,
@@ -125,7 +129,7 @@ def build_reply_text(tweet, page, p_name="", fallback_url="", fallback_index=Non
         "generated_comment": text,
         "model": "",
         "status": "fallback_used",
-        "error": "smart comment unavailable",
+        "error": "智能评论不可用，已使用评论库兜底",
     }
     audit_comment(record, "fallback_used")
     return text, record
