@@ -7,8 +7,10 @@ import random
 import threading
 import concurrent.futures
 import ctypes
+import subprocess
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+from pathlib import Path
 from urllib import parse as urlparse
 from loguru import logger
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -35,6 +37,18 @@ try:
 except Exception:
     generate_smart_comment = None
     save_comment_record = None
+
+
+def client_exe_path(name: str, module: str) -> list[str]:
+    base = Path(sys.executable).resolve().parent
+    client_root = base.parent.parent if base.parent.name.lower() == "runtime" else base
+    candidate = client_root / "runtime" / Path(name).stem / name
+    if candidate.exists():
+        return [str(candidate)]
+    candidate = client_root / name
+    if candidate.exists():
+        return [str(candidate)]
+    return [sys.executable, "-m", module]
 
 
 # ================= 底层防假死 =================
@@ -981,9 +995,20 @@ class AppGUI(tk.Toplevel):
             with open(self.config_path, "w", encoding="utf-8") as f:
                 yaml.dump(self.config, f, allow_unicode=True, sort_keys=False)
 
-            if not silent: messagebox.showinfo("成功", "配置已手动保存至 config.yaml！")
+            if not silent:
+                self.ensure_worker_supervisor_running()
+                messagebox.showinfo("成功", "配置已保存，Worker 已保持后台运行。")
         except Exception as e:
             if not silent: messagebox.showerror("错误", f"保存配置失败: {e}")
+
+    def ensure_worker_supervisor_running(self):
+        try:
+            cmd = client_exe_path("XBotSupervisor.exe", "automation.supervisor")
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            subprocess.Popen([*cmd, "--config", "automation_config.yaml"], cwd=os.getcwd(), creationflags=flags)
+            logger.info("已通知 Worker 后台守护保持运行。")
+        except Exception as exc:
+            logger.warning(f"保持 Worker 后台运行失败: {exc}")
 
     def on_closing(self):
         self.stop_script()  # 停止正在运行的业务引擎

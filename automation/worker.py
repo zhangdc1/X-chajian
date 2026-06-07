@@ -153,6 +153,7 @@ class Worker:
         self._last_config_refresh_ts = 0
         self._last_profile_sync_ts = 0
         self._last_worker_error = ""
+        self._legacy_config_mtime = 0.0
         self._job_opened_profiles: Dict[int, Dict[str, str]] = {}
         self.audit = TaskAudit(
             config.get("task_dir", "automation/tasks"),
@@ -210,6 +211,7 @@ class Worker:
             config_interval = int(self.config.get("worker_config_interval_seconds", 30) or 30)
             if now - last_config_refresh >= config_interval:
                 self.apply_central_config(save_local=True)
+                self.reload_legacy_config_if_changed()
                 last_config_refresh = now
             if now - last_heartbeat >= 30:
                 self.heartbeat()
@@ -463,6 +465,35 @@ class Worker:
         # Do not append historical worker_sync_groups here, otherwise old groups
         # can leak back into the local runtime after the user has changed them.
         self.apply_central_config(save_local=True)
+
+    def reload_legacy_config_if_changed(self) -> None:
+        if yaml is None:
+            return
+        path = self.app_root() / "config.yaml"
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if mtime <= self._legacy_config_mtime:
+            return
+        self._legacy_config_mtime = mtime
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            self._last_worker_error = f"reload config.yaml failed: {exc}"[:500]
+            return
+        if not isinstance(loaded, dict):
+            return
+        bit_api = str(loaded.get("BIT_API_URL") or "").strip()
+        if bit_api and bit_api != self.config.get("bit_api_url"):
+            self.config["bit_api_url"] = bit_api
+            self.bit = BitBrowserClient(bit_api)
+        group_id = str(loaded.get("GROUP_ID") or "").strip()
+        if group_id:
+            self.config["local_group_id"] = group_id
+        if isinstance(loaded.get("FARMING_CONFIG"), dict):
+            self.config["local_farming_config"] = loaded.get("FARMING_CONFIG") or {}
+        print("reloaded local config.yaml changes")
 
     def next_job(self) -> Optional[Dict[str, Any]]:
         url = f"{self.central_api}/worker/next?node_id={self.node_id}"

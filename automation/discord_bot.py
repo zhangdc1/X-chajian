@@ -580,7 +580,7 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             f"任务ID: {', '.join(str(x) for x in job_ids)}\n"
             f"已清理旧计划 {data.get('cleaned_plans', 0)} 个，旧调度任务 {data.get('cleaned_tasks', 0)} 个。\n"
             f"后续按分组汇总汇报，不再逐账号刷屏。"
-        ), [], {"kind": "score", "title": f"账号评分 {group_id}", "job_ids": job_ids, "group_id": group_id}
+        ), [], {"kind": "score", "title": f"账号评分 {group_id}", "job_ids": job_ids, "group_id": group_id, "suppress_single_watch": True}
     if action == "create_score_plan_jobs":
         group_id = command.get("group_id")
         if not group_id:
@@ -594,7 +594,7 @@ def format_response(command: Dict[str, Any], client: CentralClient) -> Tuple[str
             f"任务ID: {', '.join(str(x) for x in job_ids)}\n"
             f"已清理旧计划 {data.get('cleaned_plans', 0)} 个，旧调度任务 {data.get('cleaned_tasks', 0)} 个。\n"
             f"后续按分组汇总汇报，不再逐账号刷屏。"
-        ), [], {"kind": "score", "title": f"账号评分 {group_id}", "job_ids": job_ids, "group_id": group_id}
+        ), [], {"kind": "score", "title": f"账号评分 {group_id}", "job_ids": job_ids, "group_id": group_id, "suppress_single_watch": True}
     if action == "score_plans":
         plans = client.score_plans(command.get("group_id")).get("plans", [])
         if not plans:
@@ -935,6 +935,8 @@ async def watch_job_batch(channel: Any, client: CentralClient, batch: Dict[str, 
 
 
 def should_send_job_run(job_type: Optional[str], status: str, message: str) -> bool:
+    if job_type == "score_grok_plan":
+        return False
     if "本地日志文件" in message or "已打开本地 GUI" in message:
         return True
     if status == "preempted":
@@ -1163,7 +1165,7 @@ def build_discord_client(discord: Any, central: CentralClient, prefix: str, allo
         await message.channel.send(response[:1900])
         if batch:
             asyncio.create_task(watch_job_batch(message.channel, central, batch))
-        else:
+        elif command.get("action") not in {"create_score_plan_jobs", "create_grok_plan_jobs"}:
             for job_id in job_ids:
                 asyncio.create_task(watch_job(message.channel, central, job_id))
 

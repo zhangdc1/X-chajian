@@ -29,6 +29,44 @@ def load_config(path: str | Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def claim_single_instance(config_path: str | Path) -> bool:
+    lock_dir = Path("automation") / "local_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = str(Path(config_path)).replace("\\", "_").replace("/", "_").replace(":", "_")
+    lock_path = lock_dir / f"supervisor_{safe_name}.pid"
+    if lock_path.exists():
+        try:
+            old_pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+        except Exception:
+            old_pid = 0
+        if pid_is_running(old_pid):
+            return False
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
 def exe_path(name: str, module: str) -> list[str]:
     base = Path(sys.executable).resolve().parent
     client_root = base.parent.parent if base.parent.name.lower() == "runtime" else base
@@ -161,6 +199,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Keep XBotWorker running in the background")
     parser.add_argument("--config", default=str(CONFIG_PATH))
     args = parser.parse_args()
+    if not claim_single_instance(args.config):
+        return
     supervisor = WorkerSupervisor(args.config)
     if not run_tray(supervisor):
         supervisor.loop()
