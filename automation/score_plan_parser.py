@@ -52,7 +52,7 @@ def parse_score_plan(raw: str, period: str = "weekly", seed_extra: str = "") -> 
     }
 
 
-def build_tasks_from_score_plan(plan: Dict[str, Any], max_days: int = 31) -> List[Dict[str, Any]]:
+def build_tasks_from_score_plan(plan: Dict[str, Any], max_days: int = 31, fallback_config: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     parsed = plan.get("parsed_plan") or {}
     days = (parsed.get("days") or [])[:max_days]
     tasks: List[Dict[str, Any]] = []
@@ -131,11 +131,12 @@ def build_tasks_from_score_plan(plan: Dict[str, Any], max_days: int = 31) -> Lis
     fallback_period = parsed.get("period") or "weekly"
     fallback_seed = str(account_id or group_id or plan.get("id") or "")
     fallback_days = normalize_days(
-        parse_by_rules(str(plan.get("raw_excerpt") or ""), fallback_period, seed_extra=fallback_seed),
+        parse_by_rules(str(plan.get("raw_excerpt") or ""), fallback_period, seed_extra=fallback_seed, fallback_config=fallback_config),
         fallback_period,
         seed_extra=fallback_seed,
+        fallback_config=fallback_config,
     )
-    return build_tasks_from_score_plan({**plan, "parsed_plan": {**parsed, "days": fallback_days}}, max_days=max_days)
+    return build_tasks_from_score_plan({**plan, "parsed_plan": {**parsed, "days": fallback_days}}, max_days=max_days, fallback_config=fallback_config)
 
 
 def parse_markdown_tables(raw: str) -> List[Dict[str, Any]]:
@@ -237,29 +238,35 @@ def parse_plain_metric_tables(raw: str) -> List[Dict[str, Any]]:
     return days
 
 
-def parse_by_rules(raw: str, period: str, seed_extra: str = "") -> List[Dict[str, Any]]:
+def parse_by_rules(raw: str, period: str, seed_extra: str = "", fallback_config: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     days_count = 1 if period == "daily" else 7
     rng = random.Random(seed_int(period, raw[:1000], seed_extra))
     days = []
+    cfg = fallback_config or {}
     metric_ranges = {
-        "likes": (15, 35),
-        "bookmarks": (3, 12),
-        "retweets": (2, 8),
-        "replies": (2, 12),
-        "follows": (2, 5),
-        "manual_searches": (1, 2),
+        "likes": (int(cfg.get("likes_min") or 15), int(cfg.get("likes_max") or 35)),
+        "bookmarks": (int(cfg.get("bookmarks_min") or 3), int(cfg.get("bookmarks_max") or 12)),
+        "retweets": (int(cfg.get("retweets_min") or 2), int(cfg.get("retweets_max") or 8)),
+        "replies": (int(cfg.get("replies_min") or 2), int(cfg.get("replies_max") or 12)),
+        "follows": (int(cfg.get("follows_min") or 2), int(cfg.get("follows_max") or 5)),
+        "manual_searches": (int(cfg.get("manual_searches_min") or 1), int(cfg.get("manual_searches_max") or 2)),
     }
+    slot_count = max(1, int(cfg.get("slot_count") or RANDOM_SLOT_COUNT))
+    daily_follows_max = max(0, int(cfg.get("daily_follows_max") or 20))
+    daily_posts_max = max(0, int(cfg.get("daily_posts_max") or 3))
+    posts_min = max(0, int(cfg.get("posts_min") or 0))
+    posts_max = max(posts_min, int(cfg.get("posts_max") or 1))
     for day_index in range(1, days_count + 1):
         slots = []
-        slot_times = random_slot_times(f"{period}|{seed_extra}|day={day_index}|{raw[:300]}")
+        slot_times = random_slot_times(f"{period}|{seed_extra}|day={day_index}|{raw[:300]}", fallback_config=fallback_config)
         progress = 0 if days_count <= 1 else (day_index - 1) / max(1, days_count - 1)
         day_trend = 0.90 + progress * 0.16 + rng.uniform(-0.04, 0.04)
-        post_target = rng.choice([1, 1, 2, 2, 3])
-        post_indices = set(rng.sample(range(RANDOM_SLOT_COUNT), k=min(3, post_target)))
-        follows_remaining = 20
+        post_target = min(daily_posts_max, rng.randint(posts_min, posts_max))
+        post_indices = set(rng.sample(range(slot_count), k=min(slot_count, post_target)))
+        follows_remaining = daily_follows_max
         for index, slot_time in enumerate(slot_times):
-            slots_left = RANDOM_SLOT_COUNT - index
-            min_for_rest = 2 * (slots_left - 1)
+            slots_left = slot_count - index
+            min_for_rest = metric_ranges["follows"][0] * (slots_left - 1)
             follow_low, follow_high = metric_ranges["follows"]
             follow_max = min(follow_high, follows_remaining - min_for_rest)
             follows = rng.randint(follow_low, max(follow_low, follow_max))
@@ -292,18 +299,19 @@ def vary_metric(rng: random.Random, bounds: tuple[int, int], day_factor: float) 
     return max(low, min(high, base + trend_adjust + jitter))
 
 
-def normalize_days(days: List[Dict[str, Any]], period: str, seed_extra: str = "") -> List[Dict[str, Any]]:
+def normalize_days(days: List[Dict[str, Any]], period: str, seed_extra: str = "", fallback_config: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     count = 1 if period == "daily" else 30 if period == "monthly" else 7
     result = []
     today = date.today()
     for idx in range(count):
         source = days[idx] if idx < len(days) else {"slots": []}
-        slots = normalize_slots(source.get("slots") or [], seed_extra=f"{seed_extra}|day={idx + 1}")
+        slots = normalize_slots(source.get("slots") or [], seed_extra=f"{seed_extra}|day={idx + 1}", fallback_config=fallback_config)
         result.append({"day_index": idx + 1, "date": (today + timedelta(days=idx)).isoformat(), "slots": slots})
     return result
 
 
-def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "") -> List[Dict[str, Any]]:
+def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "", fallback_config: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    slot_count = max(1, int((fallback_config or {}).get("slot_count") or RANDOM_SLOT_COUNT))
     normalized = []
     seen = set()
     for slot in slots:
@@ -319,9 +327,9 @@ def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "") -> List[D
             }
         )
     normalized.sort(key=lambda item: item["time"])
-    if len(normalized) >= RANDOM_SLOT_COUNT:
-        return normalized[:RANDOM_SLOT_COUNT]
-    for slot_time in random_slot_times(f"normalize|{seed_extra}"):
+    if len(normalized) >= slot_count:
+        return normalized[:slot_count]
+    for slot_time in random_slot_times(f"normalize|{seed_extra}", fallback_config=fallback_config):
         if slot_time in seen:
             continue
         seen.add(slot_time)
@@ -332,7 +340,7 @@ def normalize_slots(slots: List[Dict[str, Any]], seed_extra: str = "") -> List[D
                 "target_urls": [],
             }
         )
-        if len(normalized) >= RANDOM_SLOT_COUNT:
+        if len(normalized) >= slot_count:
             break
     normalized.sort(key=lambda item: item["time"])
     return normalized
@@ -343,28 +351,42 @@ def seed_int(*parts: Any) -> int:
     return int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:16], 16)
 
 
-def random_slot_times(seed_material: str) -> List[str]:
+def hhmm_to_minute(text: str, default: int) -> int:
+    match = re.search(r"(\d{1,2})[:：](\d{2})", str(text or ""))
+    if not match:
+        return default
+    return max(0, min(23, int(match.group(1)))) * 60 + max(0, min(59, int(match.group(2))))
+
+
+def random_slot_times(seed_material: str, fallback_config: Dict[str, Any] | None = None) -> List[str]:
     rng = random.Random(seed_int(seed_material))
-    candidates = list(range(RANDOM_START_MINUTE, RANDOM_END_MINUTE + 1, 5))
+    cfg = fallback_config or {}
+    slot_count = max(1, int(cfg.get("slot_count") or RANDOM_SLOT_COUNT))
+    start_minute = hhmm_to_minute(str(cfg.get("start_time") or ""), RANDOM_START_MINUTE)
+    end_minute = hhmm_to_minute(str(cfg.get("end_time") or ""), RANDOM_END_MINUTE)
+    if end_minute <= start_minute:
+        start_minute, end_minute = RANDOM_START_MINUTE, RANDOM_END_MINUTE
+    min_gap = max(0, int(cfg.get("min_gap_minutes") or RANDOM_MIN_GAP_MINUTES))
+    candidates = list(range(start_minute, end_minute + 1, 5))
     for _ in range(1000):
-        picks = sorted(rng.sample(candidates, RANDOM_SLOT_COUNT))
-        if all((b - a) >= RANDOM_MIN_GAP_MINUTES for a, b in zip(picks, picks[1:])):
+        picks = sorted(rng.sample(candidates, min(slot_count, len(candidates))))
+        if all((b - a) >= min_gap for a, b in zip(picks, picks[1:])):
             return [minute_to_hhmm(item) for item in picks]
-    span = RANDOM_END_MINUTE - RANDOM_START_MINUTE
+    span = end_minute - start_minute
     picks = []
-    for index in range(RANDOM_SLOT_COUNT):
-        base = RANDOM_START_MINUTE + round(index * span / max(1, RANDOM_SLOT_COUNT - 1))
+    for index in range(slot_count):
+        base = start_minute + round(index * span / max(1, slot_count - 1))
         jitter = rng.randint(-20, 20)
-        minute = min(RANDOM_END_MINUTE, max(RANDOM_START_MINUTE, base + jitter))
+        minute = min(end_minute, max(start_minute, base + jitter))
         minute = int(round(minute / 5) * 5)
         picks.append(minute)
     picks = sorted(dict.fromkeys(picks))
-    while len(picks) < RANDOM_SLOT_COUNT:
+    while len(picks) < slot_count:
         for candidate in candidates:
             if candidate not in picks and all(abs(candidate - existing) >= 60 for existing in picks):
                 picks.append(candidate)
                 break
-    return [minute_to_hhmm(item) for item in sorted(picks[:RANDOM_SLOT_COUNT])]
+    return [minute_to_hhmm(item) for item in sorted(picks[:slot_count])]
 
 
 def minute_to_hhmm(minute: int) -> str:

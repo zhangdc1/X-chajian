@@ -18,6 +18,29 @@ DEFAULT_MODEL_CONFIG = {
     "model": "deepseek-v4-flash",
 }
 
+DEFAULT_SCORE_FALLBACK_CONFIG = {
+    "slot_count": 5,
+    "start_time": "09:00",
+    "end_time": "22:30",
+    "min_gap_minutes": 90,
+    "likes_min": 15,
+    "likes_max": 35,
+    "bookmarks_min": 3,
+    "bookmarks_max": 12,
+    "retweets_min": 2,
+    "retweets_max": 8,
+    "replies_min": 2,
+    "replies_max": 12,
+    "follows_min": 2,
+    "follows_max": 5,
+    "posts_min": 0,
+    "posts_max": 1,
+    "manual_searches_min": 1,
+    "manual_searches_max": 2,
+    "daily_follows_max": 20,
+    "daily_posts_max": 3,
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,6 +275,7 @@ class Storage:
         ts = now_ts()
         today_start = ts - (ts % 86400)
         offline_cutoff = ts - int(offline_after_seconds)
+        self.finalize_expired_leases(grace_seconds=offline_after_seconds * 2)
         with self.connect() as conn:
             worker_rows = conn.execute("SELECT * FROM worker_nodes ORDER BY last_seen DESC LIMIT 100").fetchall()
             job_status_rows = conn.execute(
@@ -279,15 +303,19 @@ class Storage:
                 """
                 SELECT * FROM jobs
                 WHERE status IN ('leased', 'cancel_requested')
+                  AND COALESCE(lease_until, 0) >= ?
                 ORDER BY updated_at DESC
                 LIMIT 20
                 """
+                ,
+                (ts,),
             ).fetchall()
             recent_fail_rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status IN ('failed', 'cancel_requested')
+                WHERE status IN ('failed', 'cancelled', 'preempted')
                   AND updated_at >= ?
+                  AND COALESCE(error, '') <> 'preempted_by_mode2'
                 ORDER BY updated_at DESC
                 LIMIT 20
                 """,
@@ -331,7 +359,7 @@ class Storage:
                 "accounts_inactive": sum(v for k, v in account_counts.items() if k != "active"),
                 "jobs_today": sum(job_counts.values()),
                 "jobs_failed_today": job_counts.get("failed", 0),
-                "jobs_running": job_counts.get("leased", 0) + job_counts.get("cancel_requested", 0),
+                "jobs_running": len(running_jobs),
                 "jobs_queued": job_counts.get("queued", 0),
                 "schedule_pending_today": schedule_counts.get("scheduled", 0),
                 "schedule_missed_today": schedule_counts.get("expired_missed", 0),
@@ -414,6 +442,66 @@ class Storage:
             "model_config": dict(DEFAULT_MODEL_CONFIG),
         }
 
+    def finalize_expired_leases(self, grace_seconds: int = 180) -> Dict[str, int]:
+        ts = now_ts()
+        cutoff = ts - max(0, int(grace_seconds))
+        preempted = 0
+        expired = 0
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, status, error, leased_by, target_node_id
+                FROM jobs
+                WHERE status IN ('leased', 'cancel_requested')
+                  AND COALESCE(lease_until, 0) > 0
+                  AND lease_until < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                job_id = int(row["id"])
+                node_id = str(row["leased_by"] or row["target_node_id"] or "")
+                if str(row["error"] or "") == "preempted_by_mode2":
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'preempted',
+                            error = '任务被模式二抢占，已重新排队，模式二完成后继续执行',
+                            updated_at = ?
+                        WHERE id = ? AND status IN ('leased', 'cancel_requested')
+                        """,
+                        (ts, job_id),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO job_runs (job_id, node_id, status, message, created_at)
+                        VALUES (?, ?, 'preempted', '模式二抢占后的旧租约已自动归档', ?)
+                        """,
+                        (job_id, node_id, ts),
+                    )
+                    preempted += 1
+                else:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'failed',
+                            error = CASE WHEN COALESCE(error, '') = '' THEN 'worker lease expired' ELSE error END,
+                            updated_at = ?
+                        WHERE id = ? AND status IN ('leased', 'cancel_requested')
+                        """,
+                        (ts, job_id),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO job_runs (job_id, node_id, status, message, created_at)
+                        VALUES (?, ?, 'failed', 'Worker 租约超时，后台自动归档', ?)
+                        """,
+                        (job_id, node_id, ts),
+                    )
+                    self._maybe_update_scheduled_task(job_id, "failed", "worker lease expired")
+                    expired += 1
+        return {"preempted_archived": preempted, "leases_failed": expired}
+
     def _get_json_setting(self, conn: sqlite3.Connection, key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         row = conn.execute("SELECT value_text FROM app_settings WHERE key = ?", (key,)).fetchone()
         if not row:
@@ -435,6 +523,40 @@ class Storage:
             """,
             (key, json.dumps(value, ensure_ascii=False), now_ts()),
         )
+
+    def get_score_fallback_config(self) -> Dict[str, Any]:
+        with self.connect() as conn:
+            cfg = self._get_json_setting(conn, "score_fallback_config", DEFAULT_SCORE_FALLBACK_CONFIG)
+        merged = dict(DEFAULT_SCORE_FALLBACK_CONFIG)
+        merged.update(cfg)
+        return self._normalize_score_fallback_config(merged)
+
+    def update_score_fallback_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        current = self.get_score_fallback_config()
+        allowed = set(DEFAULT_SCORE_FALLBACK_CONFIG)
+        for key, value in (updates or {}).items():
+            if key in allowed:
+                current[key] = value
+        current = self._normalize_score_fallback_config(current)
+        with self.connect() as conn:
+            self._set_json_setting(conn, "score_fallback_config", current)
+        return current
+
+    @staticmethod
+    def _normalize_score_fallback_config(value: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = dict(DEFAULT_SCORE_FALLBACK_CONFIG)
+        cfg.update(value or {})
+        for key, default in DEFAULT_SCORE_FALLBACK_CONFIG.items():
+            if isinstance(default, int):
+                try:
+                    cfg[key] = max(0, int(cfg.get(key, default)))
+                except (TypeError, ValueError):
+                    cfg[key] = default
+            else:
+                cfg[key] = str(cfg.get(key) or default)
+        cfg["slot_count"] = max(1, min(12, int(cfg["slot_count"])))
+        cfg["min_gap_minutes"] = max(0, min(240, int(cfg["min_gap_minutes"])))
+        return cfg
 
     def get_worker_config(self, node_id: str, mask_secrets: bool = False) -> Dict[str, Any]:
         node_id = str(node_id or "").strip()
@@ -518,7 +640,15 @@ class Storage:
             current = self._get_json_setting(conn, "worker_default_config", self.default_worker_config())
             for key, value in (updates or {}).items():
                 if key in allowed:
-                    current[key] = value
+                    if key == "model_config" and isinstance(value, dict):
+                        model_current = dict(current.get("model_config") or self.default_worker_config().get("model_config") or {})
+                        for model_key, model_value in value.items():
+                            if model_key == "api_key" and (not str(model_value or "").strip() or "***" in str(model_value) or "..." in str(model_value)):
+                                continue
+                            model_current[model_key] = model_value
+                        current[key] = model_current
+                    else:
+                        current[key] = value
             current["updated_at"] = now_ts()
             self._set_json_setting(conn, "worker_default_config", current)
         cfg = dict(self.default_worker_config())
@@ -891,6 +1021,39 @@ class Storage:
             )
         return {"sync_groups": int(cur.rowcount or 0)}
 
+    def set_worker_sync_groups(self, node_id: str, group_ids: list[str]) -> Dict[str, Any]:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            raise ValueError("missing node_id")
+        normalized = []
+        seen = set()
+        for item in group_ids or []:
+            group_id = str(item or "").strip()
+            if group_id and group_id not in seen:
+                normalized.append(group_id)
+                seen.add(group_id)
+        ts = now_ts()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE worker_sync_groups SET status = 'deleted', updated_at = ? WHERE node_id = ? AND status <> 'deleted'",
+                (ts, node_id),
+            )
+            for group_id in normalized:
+                conn.execute(
+                    """
+                    INSERT INTO worker_sync_groups (node_id, group_id, status, created_at, updated_at)
+                    VALUES (?, ?, 'active', ?, ?)
+                    ON CONFLICT(node_id, group_id) DO UPDATE SET
+                        status = 'active',
+                        updated_at = excluded.updated_at
+                    """,
+                    (node_id, group_id, ts, ts),
+                )
+            current = self._get_json_setting(conn, f"worker_config:{node_id}", {})
+            current["updated_at"] = ts
+            self._set_json_setting(conn, f"worker_config:{node_id}", current)
+        return {"node_id": node_id, "sync_group_ids": normalized, "sync_groups": len(normalized)}
+
     def list_worker_sync_groups(self, node_id: Optional[str] = None) -> list[Dict[str, Any]]:
         sql = "SELECT * FROM worker_sync_groups WHERE status = 'active'"
         params: list[Any] = []
@@ -1038,7 +1201,8 @@ class Storage:
                 mode = int(payload.get("mode") or 0) if str(payload.get("mode") or "").isdigit() else 0
                 run_at = int(payload.get("run_at") or 0)
                 is_scheduled = bool(payload.get("scheduled_task_id") or payload.get("source") == "scheduled_task")
-                stale_scheduled_legacy = row["job_type"] == "legacy_mode_run" and mode != 2 and is_scheduled and run_at and run_at < cutoff
+                is_requeue = str(row["resume_policy"] or "") == "requeue_after_mode2"
+                stale_scheduled_legacy = row["job_type"] == "legacy_mode_run" and mode != 2 and is_scheduled and run_at and run_at < cutoff and not is_requeue
                 stale_score_job = row["job_type"] == "score_grok_plan" and int(row["created_at"] or 0) < cutoff
                 if stale_scheduled_legacy or stale_score_job:
                     conn.execute(
@@ -1187,7 +1351,7 @@ class Storage:
             scheduled_ids = [int(row["id"]) for row in scheduled_rows]
             queued_rows = conn.execute(
                 """
-                SELECT id, payload_json, job_type, created_at FROM jobs
+                SELECT id, payload_json, job_type, created_at, resume_policy FROM jobs
                 WHERE status = 'queued'
                 """
             ).fetchall()
@@ -1198,9 +1362,10 @@ class Storage:
                 run_at = int(payload.get("run_at") or 0)
                 source = str(payload.get("source") or "")
                 mode = int(payload.get("mode") or 0) if str(payload.get("mode") or "").isdigit() else 0
+                is_requeue = str(row["resume_policy"] or "") == "requeue_after_mode2"
                 is_scheduled_legacy = include_legacy_scheduled and job_type == "legacy_mode_run" and mode != 2 and (source or payload.get("scheduled_task_id"))
                 is_score = include_score_jobs and job_type == "score_grok_plan" and int(row["created_at"] or 0) < cutoff
-                if (is_scheduled_legacy and run_at and run_at < cutoff) or is_score:
+                if (is_scheduled_legacy and run_at and run_at < cutoff and not is_requeue) or is_score:
                     stale_job_ids.append(int(row["id"]))
             if scheduled_ids:
                 placeholders = ",".join("?" for _ in scheduled_ids)
@@ -1499,6 +1664,11 @@ class Storage:
         status: Optional[str] = None,
         job_type: Optional[str] = None,
         node_id: Optional[str] = None,
+        source: Optional[str] = None,
+        group_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        sort: str = "latest",
         limit: int = 50,
     ) -> list[Dict[str, Any]]:
         sql = "SELECT * FROM jobs WHERE 1=1"
@@ -1512,7 +1682,32 @@ class Storage:
         if node_id:
             sql += " AND (target_node_id = ? OR leased_by = ?)"
             params.extend([node_id, node_id])
-        sql += " ORDER BY id DESC LIMIT ?"
+        group_id = self.resolve_group_id(group_id)
+        if group_id:
+            sql += " AND json_extract(payload_json, '$.group_id') = ?"
+            params.append(group_id)
+        if account_id:
+            sql += " AND (json_extract(payload_json, '$.account_id') = ? OR json_extract(payload_json, '$.profile_id') = ?)"
+            params.extend([account_id, account_id])
+        if mode:
+            sql += " AND CAST(json_extract(payload_json, '$.mode') AS TEXT) = ?"
+            params.append(str(mode))
+        if source:
+            if source == "scheduled":
+                sql += " AND (json_extract(payload_json, '$.scheduled_task_id') IS NOT NULL OR json_extract(payload_json, '$.source') IN ('scheduled_task', 'grok_score_plan'))"
+            elif source == "manual":
+                sql += " AND json_extract(payload_json, '$.scheduled_task_id') IS NULL AND COALESCE(json_extract(payload_json, '$.source'), '') NOT IN ('scheduled_task', 'grok_score_plan', 'score_prompt')"
+            elif source == "score":
+                sql += " AND job_type = 'score_grok_plan'"
+            else:
+                sql += " AND COALESCE(json_extract(payload_json, '$.source'), '') = ?"
+                params.append(source)
+        order = "updated_at DESC, id DESC"
+        if sort == "oldest":
+            order = "id ASC"
+        elif sort == "priority":
+            order = "priority DESC, id DESC"
+        sql += f" ORDER BY {order} LIMIT ?"
         params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -1521,8 +1716,34 @@ class Storage:
             item = dict(row)
             item["payload"] = json.loads(item.pop("payload_json") or "{}")
             item["result"] = json.loads(item.pop("result_json") or "{}")
+            item["source_label"] = self._job_source_label(item)
+            item["requeued_job_id"] = self.find_requeued_job_id(int(item["id"]))
             result.append(item)
         return result
+
+    @staticmethod
+    def _job_source_label(job: Dict[str, Any]) -> str:
+        payload = job.get("payload") or {}
+        if job.get("job_type") == "score_grok_plan":
+            return "账号评分"
+        if payload.get("scheduled_task_id") or payload.get("source") in {"scheduled_task", "grok_score_plan"}:
+            return "定时自动"
+        if job.get("preempted_from_job_id"):
+            return "抢占重排"
+        return "手动/指令"
+
+    def find_requeued_job_id(self, original_job_id: int) -> Optional[int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE preempted_from_job_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (original_job_id,),
+            ).fetchone()
+        return int(row["id"]) if row else None
 
     def list_job_runs(self, job_id: Optional[int] = None, limit: int = 100) -> list[Dict[str, Any]]:
         sql = "SELECT * FROM job_runs WHERE 1=1"
@@ -1570,6 +1791,18 @@ class Storage:
                 """,
                 (limit,),
             ).fetchall()
+            account_group_rows = conn.execute(
+                """
+                SELECT node_id, GROUP_CONCAT(DISTINCT group_id) AS group_ids
+                FROM accounts
+                WHERE status = 'active' AND COALESCE(group_id, '') <> ''
+                GROUP BY node_id
+                """
+            ).fetchall()
+        account_groups_by_node = {
+            str(row["node_id"]): [item for item in str(row["group_ids"] or "").split(",") if item]
+            for row in account_group_rows
+        }
         result = []
         for row in rows:
             item = dict(row)
@@ -1577,6 +1810,18 @@ class Storage:
             item["online"] = str(item.get("status") or "") == "online" and ts - int(item.get("last_seen") or 0) <= offline_after_seconds
             item["offline_seconds"] = max(0, ts - int(item.get("last_seen") or 0))
             item["central_config"] = self.get_worker_config(str(item.get("node_id") or ""), mask_secrets=True)
+            central_groups = [str(x) for x in (item["central_config"].get("sync_group_ids") or []) if str(x)]
+            meta = item.get("meta") or {}
+            runtime_groups = meta.get("sync_group_ids") or meta.get("group_ids") or meta.get("groups") or []
+            if isinstance(runtime_groups, str):
+                runtime_groups = [part.strip() for part in runtime_groups.split(",") if part.strip()]
+            runtime_groups = [str(x) for x in runtime_groups if str(x)]
+            account_groups = account_groups_by_node.get(str(item.get("node_id") or ""), [])
+            item["central_sync_group_ids"] = central_groups
+            item["runtime_sync_group_ids"] = runtime_groups
+            item["account_group_ids"] = account_groups
+            item["sync_mismatch"] = sorted(central_groups) != sorted(runtime_groups) if runtime_groups else False
+            item["account_mismatch"] = bool(account_groups and sorted(account_groups) != sorted(central_groups))
             result.append(item)
         return result
 
@@ -2008,6 +2253,10 @@ class Storage:
                     original_payload = json.loads(row["payload_json"] or "{}")
                     original_payload.pop("_job_id", None)
                     original_payload.pop("_local_log_path", None)
+                    original_payload["source"] = original_payload.get("source") or "preempt_requeue"
+                    original_payload["allow_late"] = True
+                    original_payload["preempted_from_job_id"] = original_job_id
+                    original_payload["run_at"] = ts
                     cur = conn.execute(
                         """
                         INSERT INTO jobs (
@@ -2274,6 +2523,9 @@ class Storage:
         status: Optional[str] = None,
         group_id: Optional[str] = None,
         account_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        sort: str = "latest",
         plan_id: Optional[int] = None,
         limit: int = 100,
     ) -> list[Dict[str, Any]]:
@@ -2289,10 +2541,21 @@ class Storage:
         if account_id:
             sql += " AND account_id = ?"
             params.append(account_id)
+        if node_id:
+            sql += " AND node_id = ?"
+            params.append(node_id)
+        if mode:
+            sql += " AND CAST(json_extract(payload_json, '$.mode') AS TEXT) = ?"
+            params.append(str(mode))
         if plan_id is not None:
             sql += " AND plan_id = ?"
             params.append(plan_id)
-        sql += " ORDER BY run_at ASC LIMIT ?"
+        if sort == "run_at_asc":
+            sql += " ORDER BY run_at ASC, id ASC LIMIT ?"
+        elif sort == "created_desc":
+            sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        else:
+            sql += " ORDER BY updated_at DESC, run_at DESC, id DESC LIMIT ?"
         params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -2449,7 +2712,7 @@ class Storage:
         if self.list_scheduled_tasks(plan_id=plan_id, limit=1):
             return 0
         if plan.get("plan_type") == "score_plan" or (plan.get("parsed_plan") or {}).get("type") == "score_plan":
-            tasks = build_tasks_from_score_plan(plan, max_days=max_days)
+            tasks = build_tasks_from_score_plan(plan, max_days=max_days, fallback_config=self.get_score_fallback_config())
         else:
             tasks = build_tasks_from_plan(plan, max_days=max_days)
         return self.approve_plan(plan_id, tasks, status="auto_scheduled")
@@ -2464,6 +2727,7 @@ class Storage:
             "expired_missed",
             "cancelled_by_user",
             "cancelled_by_new_plan",
+            "cancelled_account_inactive",
         }
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()

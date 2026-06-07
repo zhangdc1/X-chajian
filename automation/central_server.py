@@ -229,6 +229,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 status=query.get("status", [None])[0],
                 job_type=query.get("job_type", [None])[0],
                 node_id=query.get("node_id", [None])[0],
+                source=query.get("source", [None])[0],
+                group_id=query.get("group_id", [None])[0],
+                account_id=query.get("account_id", [None])[0],
+                mode=query.get("mode", [None])[0],
+                sort=query.get("sort", ["latest"])[0],
                 limit=int(query.get("limit", ["50"])[0]),
             )
             write_json(self, 200, {"ok": True, "jobs": jobs, "count": len(jobs)})
@@ -301,6 +306,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 status=query.get("status", [None])[0],
                 group_id=query.get("group_id", [None])[0],
                 account_id=query.get("account_id", [None])[0],
+                node_id=query.get("node_id", [None])[0],
+                mode=query.get("mode", [None])[0],
+                sort=query.get("sort", ["latest"])[0],
                 limit=int(query.get("limit", ["100"])[0]),
             )
             write_json(self, 200, {"ok": True, "tasks": tasks, "count": len(tasks)})
@@ -693,6 +701,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     status=query.get("status", [None])[0],
                     job_type=query.get("job_type", [None])[0],
                     node_id=query.get("node_id", [None])[0],
+                    source=query.get("source", [None])[0],
+                    group_id=query.get("group_id", [None])[0],
+                    account_id=query.get("account_id", [None])[0],
+                    mode=query.get("mode", [None])[0],
+                    sort=query.get("sort", ["latest"])[0],
                     limit=int(query.get("limit", ["200"])[0]),
                 )
                 write_json(self, 200, {"ok": True, "jobs": jobs, "count": len(jobs)})
@@ -739,6 +752,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     status=query.get("status", [None])[0],
                     group_id=query.get("group_id", [None])[0],
                     account_id=query.get("account_id", [None])[0],
+                    node_id=query.get("node_id", [None])[0],
+                    mode=query.get("mode", [None])[0],
+                    sort=query.get("sort", ["latest"])[0],
                     limit=int(query.get("limit", ["500"])[0]),
                 )
                 write_json(self, 200, {"ok": True, "tasks": tasks, "count": len(tasks)})
@@ -774,6 +790,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         },
                     },
                 )
+                return
+            if path == "/admin/api/score-fallback-config":
+                write_json(self, 200, {"ok": True, "config": self.storage.get_score_fallback_config()})
                 return
         except Exception as exc:
             write_json(self, 500, {"ok": False, "error": str(exc)})
@@ -837,9 +856,23 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self._audit(user, "update_worker_config", "worker", node_id, {"keys": sorted(payload.keys())})
                 write_json(self, 200, {"ok": True, "config": config})
                 return
+            if path.startswith("/admin/api/workers/") and path.endswith("/sync-groups"):
+                node_id = path.split("/")[4]
+                group_ids = payload.get("sync_group_ids", payload.get("group_ids", []))
+                if isinstance(group_ids, str):
+                    group_ids = [part.strip() for part in group_ids.replace("\n", ",").split(",") if part.strip()]
+                result = self.storage.set_worker_sync_groups(node_id, list(group_ids or []))
+                self._audit(user, "set_worker_sync_groups", "worker", node_id, {"result": result})
+                write_json(self, 200, {"ok": True, **result})
+                return
             if path == "/admin/api/worker-default-config":
                 config = self.storage.update_worker_default_config(payload)
                 self._audit(user, "update_worker_default_config", "setting", "worker_default_config", {"keys": sorted(payload.keys())})
+                write_json(self, 200, {"ok": True, "config": config})
+                return
+            if path == "/admin/api/score-fallback-config":
+                config = self.storage.update_score_fallback_config(payload)
+                self._audit(user, "update_score_fallback_config", "setting", "score_fallback_config", {"keys": sorted(payload.keys())})
                 write_json(self, 200, {"ok": True, "config": config})
                 return
             if path.startswith("/admin/api/score-plans/"):

@@ -43,6 +43,7 @@
         <div>
           <h1 id="pageTitle">仪表盘</h1>
           <p id="pageSubtitle">系统健康、任务和异常集中视图</p>
+          <p id="refreshHint" class="small muted"></p>
         </div>
         <div class="top-actions">
           <span id="userBadge" class="badge"></span>
@@ -96,7 +97,7 @@
             <h2>账号列表</h2>
             <div class="inline-form">
               <input id="accountFilter" placeholder="group_id / alias">
-              <label class="check"><input id="includeInactive" type="checkbox" checked>含停用</label>
+              <label class="check"><input id="includeInactive" type="checkbox" checked>包含停用</label>
               <button id="loadAccountsBtn">查询</button>
             </div>
           </div>
@@ -111,15 +112,24 @@
             <div class="inline-form">
               <select id="jobStatus">
                 <option value="">全部状态</option>
-                <option>queued</option>
-                <option>leased</option>
-                <option>completed</option>
-                <option>failed</option>
-                <option>cancelled</option>
-                <option>cancel_requested</option>
-                <option>preempted</option>
+                <option value="queued">排队中</option>
+                <option value="leased">执行中</option>
+                <option value="completed">已完成</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
+                <option value="cancel_requested">取消中</option>
+                <option value="preempted">已抢占</option>
               </select>
-              <input id="jobNode" placeholder="node_id">
+              <select id="jobSource">
+                <option value="">全部来源</option>
+                <option value="scheduled">定时自动</option>
+                <option value="manual">手动/指令</option>
+                <option value="score">账号评分</option>
+              </select>
+              <input id="jobNode" placeholder="电脑">
+              <input id="jobGroup" placeholder="分组">
+              <input id="jobAccount" placeholder="账号">
+              <input id="jobMode" placeholder="模式">
               <button id="loadJobsBtn">查询</button>
               <button id="bulkCancelJobsBtn" class="ghost danger">批量取消</button>
               <button id="cleanupStaleBtn" class="ghost danger">清理过期队列</button>
@@ -142,10 +152,17 @@
         </div>
         <div class="panel">
           <div class="panel-head"><h2>中央评分提示词</h2></div>
-          <textarea id="scorePrompt" rows="12"></textarea>
+          <textarea id="scorePrompt" rows="10"></textarea>
           <div class="row-actions">
             <button id="savePromptBtn">保存提示词</button>
             <button id="resetPromptBtn" class="ghost danger">恢复默认</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>兜底计划配置</h2></div>
+          <div id="fallbackConfigBox"></div>
+          <div class="row-actions">
+            <button id="saveFallbackBtn">保存兜底配置</button>
           </div>
         </div>
       </section>
@@ -157,14 +174,18 @@
             <div class="inline-form">
               <select id="taskStatus">
                 <option value="">全部状态</option>
-                <option>scheduled</option>
-                <option>paused</option>
-                <option>dispatched</option>
-                <option>completed</option>
-                <option>failed</option>
-                <option>expired_missed</option>
-                <option>cancelled_by_user</option>
+                <option value="scheduled">待执行</option>
+                <option value="paused">已暂停</option>
+                <option value="dispatched">已派发</option>
+                <option value="completed">已完成</option>
+                <option value="failed">失败</option>
+                <option value="expired_missed">已过期</option>
+                <option value="cancelled_by_user">已取消</option>
               </select>
+              <input id="taskNode" placeholder="电脑">
+              <input id="taskGroup" placeholder="分组">
+              <input id="taskAccount" placeholder="账号">
+              <input id="taskMode" placeholder="模式">
               <button id="loadScheduleBtn">查询</button>
               <button id="bulkPauseBtn" class="ghost">批量暂停</button>
               <button id="bulkResumeBtn" class="ghost">批量恢复</button>
@@ -182,8 +203,11 @@
             <div id="auditTable"></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><h2>系统设置</h2></div>
+            <div class="panel-head"><h2>模型与系统设置</h2></div>
             <div id="settingsBox"></div>
+            <div class="row-actions">
+              <button id="saveModelBtn">保存默认模型配置</button>
+            </div>
           </div>
         </div>
       </section>
@@ -195,7 +219,7 @@
       <h2 id="dialogTitle">详情</h2>
       <button id="closeDialog" class="ghost">关闭</button>
     </div>
-    <pre id="dialogBody"></pre>
+    <div id="dialogBody" class="dialog-body"></div>
   </dialog>
 
   <script src="/admin/app.js"></script>

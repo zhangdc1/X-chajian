@@ -1,15 +1,15 @@
-# OpenAI-compatible model settings for semantic commands, plan parsing and smart comments.
-# Copy this file to model_config.yaml on the machine that needs model features.
-enabled: true
+# OpenAI-compatible model settings.
+# Client releases keep this file secret-free. Worker defaults are pulled from the central controller.
+enabled: false
 provider: openai_compatible
-base_url: "https://api.deepseek.com/v1"
-api_key: "sk-8dc4ccade0764eab89c44692a68ac06b"
-model: "deepseek-v4-flash"
+base_url: ""
+api_key: ""
+model: ""
 timeout_seconds: 30
 temperature: 0.1
 
 smart_comment:
-  enabled: true
+  enabled: false
   auto_publish: true
   save_drafts: true
   fallback_to_comment_library: true
